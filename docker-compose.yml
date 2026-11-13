@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: surshongi-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: surshongi
+      POSTGRES_PASSWORD: surshongi_pass
+      POSTGRES_DB: surshongi_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U surshongi -d surshongi_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: surshongi-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      FRONTEND_ORIGIN: http://localhost:3000
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
