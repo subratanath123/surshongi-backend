@@ -28,8 +28,13 @@ services:
     environment:
       PORT: "8080"
       FRONTEND_ORIGIN: http://localhost:3000
+      DATABASE_URL: postgresql://surshongi:surshongi_pass@postgres:5432/surshongi_db
+      UPLOAD_DIR: /app/uploads
     ports:
       - "8080:8080"
+    volumes:
+      - api-uploads:/app/uploads
 
 volumes:
   pgdata:
+  api-uploads:

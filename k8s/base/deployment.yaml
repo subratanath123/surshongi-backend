@@ -62,6 +62,8 @@ spec:
             # Comma-separated Vercel origins allowed to call this API.
             - name: FRONTEND_ORIGIN
               value: "http://localhost:3000"
+            - name: UPLOAD_DIR
+              value: "/app/uploads"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false

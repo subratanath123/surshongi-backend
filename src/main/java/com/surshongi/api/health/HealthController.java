@@ -6,7 +6,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 public class HealthController {
-  @GetMapping("/api/health")
+  @GetMapping({"/api/health", "/health", "/actuator/health"})
   public Map<String, Object> health() {
     return Map.of("ok", true, "service", "surshongi-api");
   }
