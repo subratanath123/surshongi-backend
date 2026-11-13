@@ -20,6 +20,8 @@ public class SchemaMigrator implements ApplicationRunner {
   public void run(ApplicationArguments args) {
     String[] statements = {
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT",
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS selfie_verified BOOLEAN NOT NULL DEFAULT FALSE",
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS feed_preferences JSONB NOT NULL DEFAULT '[]'::jsonb",
       "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS post_id TEXT",
       "ALTER TABLE service_orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'none'",
       "ALTER TABLE service_orders ADD COLUMN IF NOT EXISTS payment_submitted_at TIMESTAMPTZ",

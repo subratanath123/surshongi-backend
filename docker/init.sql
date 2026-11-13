@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS users (
   bkash_number TEXT,
   is_private BOOLEAN NOT NULL DEFAULT FALSE,
   gender TEXT,
+  selfie_verified BOOLEAN NOT NULL DEFAULT FALSE,
+  feed_preferences JSONB NOT NULL DEFAULT '[]'::jsonb,
   profile_completed BOOLEAN NOT NULL DEFAULT FALSE,
   name TEXT NOT NULL,
   name_bn TEXT NOT NULL,

@@ -18,6 +18,7 @@ public class CommunityActions {
   private static final DateTimeFormatter ISO =
       DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
   private static final Pattern YOUTUBE = Pattern.compile("^[\\w-]{11}$");
+  private static final Pattern SELFIE = Pattern.compile("^/uploads/img-[\\w.-]+$");
   private static final Pattern MEDIA = Pattern.compile("^/(uploads|media|covers)/[\\w.-]+$");
   private static final Set<String> CATEGORIES = Set.of("work", "offering", "collab");
   private static final Set<String> VIDEO = Set.of(".mp4", ".webm", ".mov", ".m4v", ".mkv");
@@ -48,6 +49,8 @@ public class CommunityActions {
       case "updateProfileVisibility" -> visibility(me, body);
       case "updateGender" -> gender(me, body);
       case "updateProfilePhotos" -> photos(me, body);
+      case "verifySelfie" -> selfie(me, body);
+      case "updateFeedPreferences" -> preferences(me, body);
       case "addCollectionItem" -> collection(me, body);
       case "createPost" -> createPost(me, body, meUser);
       case "updatePost" -> updatePost(me, body, db);
@@ -153,6 +156,31 @@ public class CommunityActions {
       throw new ApiException(400, "Choose female or male.");
     }
     repo.updateGender(me, str(body.get("gender")));
+    return userResponse(me);
+  }
+
+  private static final Set<String> FEED_PREFS = Set.of(
+      "vocalist", "guitarist", "percussion", "flute", "producer", "lyricist",
+      "folk", "rabindra", "nazrul", "pop");
+
+  private Map<String, Object> preferences(String me, Map<String, Object> body) {
+    List<String> chosen = new ArrayList<>();
+    if (body.get("preferences") instanceof List<?> list) {
+      for (Object item : list) {
+        String value = str(item);
+        if (FEED_PREFS.contains(value) && !chosen.contains(value) && chosen.size() < 8) chosen.add(value);
+      }
+    }
+    repo.updateFeedPreferences(me, chosen);
+    return userResponse(me);
+  }
+
+  private Map<String, Object> selfie(String me, Map<String, Object> body) {
+    String avatar = str(body.get("avatarUrl")).trim();
+    if (!SELFIE.matcher(avatar).matches()) {
+      throw new ApiException(400, "Take the photo with your camera.");
+    }
+    repo.verifySelfie(me, avatar);
     return userResponse(me);
   }
 
@@ -452,6 +480,7 @@ public class CommunityActions {
       if (!copy.get("id").equals(viewerId)) {
         copy.remove("email");
         copy.remove("googleSub");
+        copy.remove("feedPreferences");
       }
       users.add(copy);
     }

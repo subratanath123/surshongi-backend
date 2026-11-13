@@ -1,5 +1,9 @@
 package com.surshongi.api.community;
 
+import java.math.BigDecimal;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -45,6 +49,120 @@ public class CommunityRepository {
     db.put("orders", jdbc.query("SELECT * FROM service_orders ORDER BY created_at DESC", (rs, n) -> order(rs)));
     db.put("reviews", jdbc.query("SELECT * FROM order_reviews ORDER BY created_at DESC", (rs, n) -> review(rs)));
     return db;
+  }
+
+  public List<String> feedPreferences(String userId) {
+    if (userId == null || userId.isBlank()) return List.of();
+    List<String> rows = jdbc.query(
+        "SELECT feed_preferences::text FROM users WHERE id = ?",
+        (rs, n) -> rs.getString(1),
+        userId);
+    return rows.isEmpty() ? List.of() : JsonText.strings(rows.get(0));
+  }
+
+  public List<FeedSlot> pageFeed(String viewerId, String filter, String[] preferences, FeedCursor cursor, int limit) {
+    String viewer = viewerId == null ? "" : viewerId;
+    String extra = switch (filter == null ? "" : filter) {
+      case "following" -> " AND p.musician_id IN (SELECT musician_id FROM user_follows WHERE follower_id = ?)";
+      case "vocal" -> roleFilter("vocalist");
+      case "guitar" -> roleFilter("guitarist");
+      case "percussion" -> roleFilter("percussion");
+      case "folk" -> """
+           AND EXISTS (
+             SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genre_terms, '[]'::jsonb)) term
+             WHERE lower(term) IN ('folk', 'লোক')
+           )""";
+      default -> "";
+    };
+    String cursorSql = cursor == null ? "" : """
+         AND (
+           pref_match < ?
+           OR (pref_match = ? AND rating_count < ?)
+           OR (pref_match = ? AND rating_count = ? AND popular < ?)
+           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating < ?)
+           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating = ? AND created_at < ?)
+           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating = ? AND created_at = ? AND id < ?)
+         )""";
+    String sql = """
+        WITH ranked AS (
+          SELECT p.id,
+            CASE
+              WHEN cardinality(?::text[]) = 0 THEN 0
+              WHEN lower(p.role_tag) = ANY(?::text[]) THEN 1
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.roles, '[]'::jsonb)) role
+                WHERE lower(role) = ANY(?::text[])
+              ) THEN 1
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genre_terms, '[]'::jsonb)) term
+                WHERE lower(term) = ANY(?::text[])
+              ) THEN 1
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genres, '[]'::jsonb)) genre
+                WHERE lower(genre) = ANY(?::text[])
+              ) THEN 1
+              ELSE 0
+            END AS pref_match,
+            u.rating_count,
+            (u.followers + p.loves) AS popular,
+            u.rating,
+            p.created_at
+          FROM community_posts p
+          JOIN users u ON u.id = p.musician_id
+          WHERE (u.is_private = FALSE OR (? <> '' AND u.id = ?))
+        """ + extra + """
+        )
+        SELECT id, pref_match, rating_count, popular, rating, created_at
+        FROM ranked
+        WHERE TRUE
+        """ + cursorSql + """
+        ORDER BY pref_match DESC, rating_count DESC, popular DESC, rating DESC, created_at DESC, id DESC
+        LIMIT ?
+        """;
+    String[] terms = preferences == null ? new String[0] : preferences;
+    return jdbc.query((Connection con) -> {
+      PreparedStatement ps = con.prepareStatement(sql);
+      Array array = con.createArrayOf("text", terms);
+      int i = 1;
+      for (int n = 0; n < 5; n++) ps.setArray(i++, array);
+      ps.setString(i++, viewer);
+      ps.setString(i++, viewer);
+      if ("following".equals(filter)) ps.setString(i++, viewer);
+      if (cursor != null) i = cursor.bind(ps, i);
+      ps.setInt(i, limit);
+      return ps;
+    }, (rs, n) -> new FeedSlot(
+        rs.getString("id"),
+        rs.getInt("pref_match"),
+        rs.getInt("rating_count"),
+        rs.getInt("popular"),
+        rs.getBigDecimal("rating"),
+        rs.getTimestamp("created_at").toInstant().toEpochMilli()));
+  }
+
+  public List<Map<String, Object>> postsByIds(List<String> ids) {
+    return byIds("SELECT * FROM community_posts WHERE id IN (", ids, (rs, n) -> post(rs));
+  }
+
+  public List<Map<String, Object>> usersByIds(List<String> ids) {
+    return byIds("SELECT * FROM users WHERE id IN (", ids, (rs, n) -> user(rs));
+  }
+
+  private List<Map<String, Object>> byIds(String prefix, List<String> ids, org.springframework.jdbc.core.RowMapper<Map<String, Object>> mapper) {
+    if (ids.isEmpty()) return List.of();
+    String marks = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+    return jdbc.query(prefix + marks + ")", mapper, ids.toArray());
+  }
+
+  private static String roleFilter(String role) {
+    return """
+         AND (
+           lower(p.role_tag) = '%s'
+           OR EXISTS (
+             SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.roles, '[]'::jsonb)) role
+             WHERE lower(role) = '%s'
+           )
+         )""".formatted(role, role);
   }
 
   public String publicName(String id) {
@@ -101,7 +219,11 @@ public class CommunityRepository {
           phone = EXCLUDED.phone,
           bkash_number = EXCLUDED.bkash_number,
           is_private = EXCLUDED.is_private,
-          gender = EXCLUDED.gender
+          gender = EXCLUDED.gender,
+          selfie_verified = CASE
+            WHEN EXCLUDED.avatar_url IS NOT NULL AND EXCLUDED.avatar_url IS DISTINCT FROM users.avatar_url THEN FALSE
+            ELSE users.selfie_verified
+          END
         """,
         user.get("id"),
         user.get("email"),
@@ -153,8 +275,18 @@ public class CommunityRepository {
     jdbc.update("UPDATE users SET phone = ?, bkash_number = ? WHERE id = ?", blankToNull(phone), blankToNull(bkash), userId);
   }
 
+  public void updateFeedPreferences(String userId, List<String> preferences) {
+    jdbc.update("UPDATE users SET feed_preferences = CAST(? AS jsonb) WHERE id = ?", JsonText.array(preferences), userId);
+  }
+
+  public void verifySelfie(String userId, String avatarUrl) {
+    jdbc.update("UPDATE users SET avatar_url = ?, selfie_verified = TRUE WHERE id = ?", avatarUrl, userId);
+  }
+
   public void updatePhotos(String userId, String avatar, String cover, Integer position) {
-    if (avatar != null) jdbc.update("UPDATE users SET avatar_url = ? WHERE id = ?", avatar, userId);
+    if (avatar != null) {
+      jdbc.update("UPDATE users SET avatar_url = ?, selfie_verified = FALSE WHERE id = ?", avatar, userId);
+    }
     if (cover != null) jdbc.update("UPDATE users SET cover_url = ? WHERE id = ?", cover, userId);
     if (position != null) {
       int clamped = Math.max(0, Math.min(100, position));
@@ -413,6 +545,8 @@ public class CommunityRepository {
     put(row, "phone", rs.getString("phone"));
     put(row, "bkashNumber", rs.getString("bkash_number"));
     row.put("isPrivate", rs.getBoolean("is_private"));
+    row.put("selfieVerified", rs.getBoolean("selfie_verified"));
+    row.put("feedPreferences", list(rs, "feed_preferences"));
     row.put("profileCompleted", rs.getBoolean("profile_completed"));
     row.put("name", rs.getString("name"));
     row.put("nameBn", rs.getString("name_bn"));
@@ -608,5 +742,35 @@ public class CommunityRepository {
 
   private static String blankToNull(String value) {
     return value == null || value.isBlank() ? null : value;
+  }
+
+  public record FeedSlot(String id, int preferred, int ratingCount, int popular, BigDecimal rating, long createdAtEpoch) {}
+
+  public record FeedCursor(int preferred, int ratingCount, int popular, BigDecimal rating, Timestamp createdAt, String id) {
+    int bind(PreparedStatement ps, int index) throws SQLException {
+      int i = index;
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, ratingCount);
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, ratingCount);
+      ps.setInt(i++, popular);
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, ratingCount);
+      ps.setInt(i++, popular);
+      ps.setBigDecimal(i++, rating);
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, ratingCount);
+      ps.setInt(i++, popular);
+      ps.setBigDecimal(i++, rating);
+      ps.setTimestamp(i++, createdAt);
+      ps.setInt(i++, preferred);
+      ps.setInt(i++, ratingCount);
+      ps.setInt(i++, popular);
+      ps.setBigDecimal(i++, rating);
+      ps.setTimestamp(i++, createdAt);
+      ps.setString(i++, id);
+      return i;
+    }
   }
 }
