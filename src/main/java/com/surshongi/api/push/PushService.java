@@ -67,10 +67,11 @@ public class PushService {
   private void send(String token, String title, String body, String url) throws Exception {
     Credentials creds = credentials();
     if (creds == null) return;
-    String payload = "{\"message\":{\"token\":\"" + escape(token) + "\",\"data\":{"
-        + "\"title\":\"" + escape(title) + "\","
-        + "\"body\":\"" + escape(body) + "\","
-        + "\"url\":\"" + escape(url) + "\"}}}";
+    String icon = url + "/icons/icon-192.png";
+    String payload = "{\"message\":{\"token\":\"" + escape(token) + "\","
+        + "\"notification\":{\"title\":\"" + escape(title) + "\",\"body\":\"" + escape(body) + "\"},"
+        + "\"webpush\":{\"fcm_options\":{\"link\":\"" + escape(url) + "\"},"
+        + "\"notification\":{\"icon\":\"" + escape(icon) + "\"}}}}";
     HttpRequest request = HttpRequest.newBuilder(URI.create(
             "https://fcm.googleapis.com/v1/projects/" + creds.projectId + "/messages:send"))
         .timeout(Duration.ofSeconds(8))
