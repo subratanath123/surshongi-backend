@@ -1,5 +1,6 @@
 package com.surshongi.api.auth;
 
+import com.surshongi.api.activity.ActivityService;
 import com.surshongi.api.community.CommunityRepository;
 import com.surshongi.api.session.SessionService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -17,16 +18,19 @@ import org.springframework.web.bind.annotation.RestController;
 public class SessionController {
   private final CommunityRepository repo;
   private final SessionService sessions;
+  private final ActivityService activity;
   private final String clientId;
   private final String clientSecret;
 
   public SessionController(
       CommunityRepository repo,
       SessionService sessions,
+      ActivityService activity,
       @Value("${surshongi.google-client-id:}") String clientId,
       @Value("${surshongi.google-client-secret:}") String clientSecret) {
     this.repo = repo;
     this.sessions = sessions;
+    this.activity = activity;
     this.clientId = clientId == null ? "" : clientId.trim();
     this.clientSecret = clientSecret == null ? "" : clientSecret.trim();
   }
@@ -53,8 +57,22 @@ public class SessionController {
   }
 
   @DeleteMapping({"/auth/session", "/api/auth/session"})
-  public Map<String, Object> delete(HttpServletResponse response) {
+  public Map<String, Object> delete(HttpServletRequest request, HttpServletResponse response) {
+    String id = sessions.userId(request);
+    if (id != null) {
+      Map<String, Object> user = repo.userById(id);
+      activity.record(
+          "logout",
+          id,
+          user == null ? "" : text(user.get("name")),
+          user == null ? "" : text(user.get("email")),
+          "/");
+    }
     response.addHeader(HttpHeaders.SET_COOKIE, sessions.clearSessionCookie());
     return Map.of("ok", true);
+  }
+
+  private static String text(Object value) {
+    return value == null ? "" : String.valueOf(value);
   }
 }

@@ -1,5 +1,6 @@
 package com.surshongi.api.auth;
 
+import com.surshongi.api.activity.ActivityService;
 import com.surshongi.api.community.CommunityActions;
 import com.surshongi.api.session.SessionService;
 import com.surshongi.api.web.ApiException;
@@ -34,6 +35,7 @@ public class GoogleAuthController {
   private final SessionService sessions;
   private final GoogleUsers users;
   private final CommunityActions community;
+  private final ActivityService activity;
   private final JsonMapper json;
   private final String siteUrl;
   private final String clientId;
@@ -43,6 +45,7 @@ public class GoogleAuthController {
       SessionService sessions,
       GoogleUsers users,
       CommunityActions community,
+      ActivityService activity,
       JsonMapper json,
       @Value("${surshongi.site-url:http://localhost:3000}") String siteUrl,
       @Value("${surshongi.google-client-id:}") String clientId,
@@ -50,6 +53,7 @@ public class GoogleAuthController {
     this.sessions = sessions;
     this.users = users;
     this.community = community;
+    this.activity = activity;
     this.json = json;
     this.siteUrl = siteUrl.replaceAll("/$", "");
     this.clientId = clientId == null ? "" : clientId.trim();
@@ -117,6 +121,7 @@ public class GoogleAuthController {
           email,
           profile.get("name") == null ? null : String.valueOf(profile.get("name")),
           profile.get("picture") == null ? null : String.valueOf(profile.get("picture")));
+      activity.record("login", String.valueOf(user.get("id")), text(user.get("name")), email, "/");
       boolean completed = Boolean.TRUE.equals(user.get("profileCompleted"));
       String destination = completed
           ? ("en".equals(locale) ? "/en/u/" : "/u/") + user.get("id")
@@ -158,10 +163,15 @@ public class GoogleAuthController {
         info.get("name") == null ? null : String.valueOf(info.get("name")),
         info.get("picture") == null ? null : String.valueOf(info.get("picture")));
     response.addHeader(HttpHeaders.SET_COOKIE, sessions.sessionCookie(String.valueOf(user.get("id"))));
+    activity.record("login", String.valueOf(user.get("id")), text(user.get("name")), email, "/");
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("db", community.databaseFor(String.valueOf(user.get("id"))));
     payload.put("user", user);
     return payload;
+  }
+
+  private static String text(Object value) {
+    return value == null ? "" : String.valueOf(value);
   }
 
   private ResponseEntity<Void> fail(String register, String reason) {

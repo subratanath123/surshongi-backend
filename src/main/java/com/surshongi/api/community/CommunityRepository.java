@@ -58,6 +58,11 @@ public class CommunityRepository {
     return db;
   }
 
+  public Map<String, Object> userById(String id) {
+    Document doc = find("users", id);
+    return doc == null ? null : user(doc);
+  }
+
   public List<String> feedPreferences(String userId) {
     Document user = find("users", userId);
     if (user == null) return List.of();
