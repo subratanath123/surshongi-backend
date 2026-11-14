@@ -69,9 +69,10 @@ public class PushService {
     if (creds == null) return;
     String icon = url + "/icons/icon-192.png";
     String payload = "{\"message\":{\"token\":\"" + escape(token) + "\","
-        + "\"notification\":{\"title\":\"" + escape(title) + "\",\"body\":\"" + escape(body) + "\"},"
-        + "\"webpush\":{\"fcm_options\":{\"link\":\"" + escape(url) + "\"},"
-        + "\"notification\":{\"icon\":\"" + escape(icon) + "\"}}}}";
+        + "\"data\":{\"title\":\"" + escape(title) + "\",\"body\":\"" + escape(body) + "\",\"url\":\"" + escape(url) + "\"},"
+        + "\"webpush\":{\"headers\":{\"Urgency\":\"high\"},"
+        + "\"fcm_options\":{\"link\":\"" + escape(url) + "\"},"
+        + "\"notification\":{\"title\":\"" + escape(title) + "\",\"body\":\"" + escape(body) + "\",\"icon\":\"" + escape(icon) + "\"}}}}";
     HttpRequest request = HttpRequest.newBuilder(URI.create(
             "https://fcm.googleapis.com/v1/projects/" + creds.projectId + "/messages:send"))
         .timeout(Duration.ofSeconds(8))
