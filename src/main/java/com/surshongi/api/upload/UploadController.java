@@ -4,7 +4,6 @@ import com.mongodb.client.gridfs.model.GridFSFile;
 import com.surshongi.api.session.SessionService;
 import com.surshongi.api.web.ApiException;
 import jakarta.servlet.http.HttpServletRequest;
-import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -70,23 +69,20 @@ public class UploadController {
     String prefix = image ? "img" : video ? "video" : "audio";
     String name = prefix + "-" + Long.toString(System.currentTimeMillis(), 36) + "-"
         + Integer.toString((int) (Math.random() * 60466176), 36) + safeExt;
-    boolean isAudio = !image && !video;
-    if (isAudio) {
-      String contentType = TYPES.getOrDefault(safeExt, type.startsWith("audio/") ? type : "application/octet-stream");
+    String contentType = TYPES.getOrDefault(safeExt, type.isBlank() ? "application/octet-stream" : type);
+    if (image || !video) {
       try (InputStream body = file.getInputStream()) {
-        this.audio.save(name, contentType, body);
+        if (image) images.save(name, contentType, body);
+        else audio.save(name, contentType, body);
       }
     } else {
       Path target = root.resolve(name).normalize();
       if (!target.startsWith(root)) throw new ApiException(400, "Upload failed");
-      String contentType = TYPES.getOrDefault(safeExt, type.isBlank() ? "application/octet-stream" : type);
-      byte[] bytes = file.getBytes();
       try {
         Files.createDirectories(root);
-        Files.write(target, bytes);
+        file.transferTo(target);
       } catch (IOException ex) {
-        if (!image) throw new ApiException(500, "The file could not be stored.");
-        images.save(name, contentType, new ByteArrayInputStream(bytes));
+        throw new ApiException(500, "The file could not be stored.");
       }
     }
     String display = original.replaceAll("\\.[^.]+$", "");
@@ -97,7 +93,7 @@ public class UploadController {
   public ResponseEntity<InputStreamResource> file(@PathVariable String name, HttpServletRequest request) throws IOException {
     if (!name.matches("[\\w.-]+") || name.startsWith(".")) return ResponseEntity.notFound().build();
     GridFSFile stored = name.startsWith("audio-") ? audio.find(name) : name.startsWith("img-") ? images.find(name) : null;
-    if (stored != null && !(name.startsWith("img-") && onDisk(name))) {
+    if (stored != null) {
       String storedType = TYPES.getOrDefault(extension(name), "application/octet-stream");
       if (stored.getMetadata() != null && stored.getMetadata().getString("contentType") != null) {
         storedType = stored.getMetadata().getString("contentType");
@@ -114,11 +110,6 @@ public class UploadController {
     String type = TYPES.getOrDefault(extension(name), "application/octet-stream");
     Path file = path;
     return bytes(request, size, type, start -> openFile(file, start));
-  }
-
-  private boolean onDisk(String name) {
-    Path path = root.resolve(name).normalize();
-    return path.startsWith(root) && Files.isRegularFile(path);
   }
 
   private ResponseEntity<InputStreamResource> bytes(HttpServletRequest request, long size, String type, RangeSource source) throws IOException {

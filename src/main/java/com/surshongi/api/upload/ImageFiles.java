@@ -12,7 +12,7 @@ import org.bson.types.ObjectId;
 import org.springframework.data.mongodb.MongoDatabaseFactory;
 import org.springframework.stereotype.Component;
 
-/** Profile photos when the uploads folder cannot be written. */
+/** Profile photos, covers, and other images. Stored in MongoDB, not on the app server. */
 @Component
 public class ImageFiles {
   private final GridFSBucket bucket;
