@@ -1,743 +1,767 @@
 package com.surshongi.api.community;
 
 import java.math.BigDecimal;
-import java.sql.Array;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Timestamp;
+import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import org.springframework.jdbc.core.JdbcTemplate;
+import java.util.Set;
+import org.bson.Document;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Repository;
-import org.springframework.transaction.annotation.Transactional;
 
 @Repository
 public class CommunityRepository {
   private static final DateTimeFormatter ISO =
       DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
+  private static final Set<String> DATE_KEYS = Set.of(
+      "createdAt", "updatedAt", "readAt", "emailNotifiedAt", "paymentSubmittedAt",
+      "paymentConfirmedAt", "deliveredAt", "completedAt");
 
-  private final JdbcTemplate jdbc;
+  private final MongoTemplate mongo;
 
-  public CommunityRepository(JdbcTemplate jdbc) {
-    this.jdbc = jdbc;
+  public CommunityRepository(MongoTemplate mongo) {
+    this.mongo = mongo;
   }
 
   public Map<String, Object> read() {
     Map<String, Object> db = new LinkedHashMap<>();
-    db.put("users", jdbc.query("SELECT * FROM users ORDER BY created_at DESC", (rs, n) -> user(rs)));
-    db.put("collections", jdbc.query("SELECT * FROM showcase_items ORDER BY created_at DESC", (rs, n) -> collection(rs)));
-    db.put("posts", jdbc.query("SELECT * FROM community_posts ORDER BY created_at DESC", (rs, n) -> post(rs)));
+    db.put("users", mapAll("users", this::user, createdDesc()));
+    db.put("collections", mapAll("showcase_items", this::collection, createdDesc()));
+    db.put("posts", mapAll("community_posts", this::post, createdDesc()));
     Map<String, List<String>> follows = new LinkedHashMap<>();
-    jdbc.query("SELECT follower_id, musician_id FROM user_follows", rs -> {
-      follows.computeIfAbsent(rs.getString("follower_id"), key -> new ArrayList<>()).add(rs.getString("musician_id"));
-    });
+    for (Document row : mongo.findAll(Document.class, "user_follows")) {
+      follows.computeIfAbsent(str(row.get("followerId")), key -> new ArrayList<>()).add(str(row.get("musicianId")));
+    }
     db.put("follows", follows);
     Map<String, Map<String, Integer>> ratings = new LinkedHashMap<>();
-    jdbc.query("SELECT rater_id, musician_id, rating FROM user_ratings", rs -> {
-      ratings.computeIfAbsent(rs.getString("rater_id"), key -> new LinkedHashMap<>())
-          .put(rs.getString("musician_id"), rs.getInt("rating"));
-    });
+    for (Document row : mongo.findAll(Document.class, "user_ratings")) {
+      ratings.computeIfAbsent(str(row.get("raterId")), key -> new LinkedHashMap<>())
+          .put(str(row.get("musicianId")), num(row.get("rating")));
+    }
     db.put("ratings", ratings);
-    db.put("messages", jdbc.query("SELECT * FROM chat_messages ORDER BY created_at ASC", (rs, n) -> message(rs)));
-    db.put("orders", jdbc.query("SELECT * FROM service_orders ORDER BY created_at DESC", (rs, n) -> order(rs)));
-    db.put("reviews", jdbc.query("SELECT * FROM order_reviews ORDER BY created_at DESC", (rs, n) -> review(rs)));
+    db.put("messages", mapAll("chat_messages", this::message, Sort.by(Sort.Direction.ASC, "createdAt")));
+    db.put("orders", mapAll("service_orders", this::order, createdDesc()));
+    db.put("reviews", mapAll("order_reviews", this::review, createdDesc()));
     return db;
   }
 
   public List<String> feedPreferences(String userId) {
-    if (userId == null || userId.isBlank()) return List.of();
-    List<String> rows = jdbc.query(
-        "SELECT feed_preferences::text FROM users WHERE id = ?",
-        (rs, n) -> rs.getString(1),
-        userId);
-    return rows.isEmpty() ? List.of() : JsonText.strings(rows.get(0));
+    Document user = find("users", userId);
+    if (user == null) return List.of();
+    return strings(user.get("feedPreferences"));
   }
 
   public List<FeedSlot> pageFeed(String viewerId, String filter, String[] preferences, FeedCursor cursor, int limit) {
     String viewer = viewerId == null ? "" : viewerId;
-    String extra = switch (filter == null ? "" : filter) {
-      case "following" -> " AND p.musician_id IN (SELECT musician_id FROM user_follows WHERE follower_id = ?)";
-      case "vocal" -> roleFilter("vocalist");
-      case "guitar" -> roleFilter("guitarist");
-      case "percussion" -> roleFilter("percussion");
-      case "folk" -> """
-           AND EXISTS (
-             SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genre_terms, '[]'::jsonb)) term
-             WHERE lower(term) IN ('folk', 'লোক')
-           )""";
-      default -> "";
-    };
-    String cursorSql = cursor == null ? "" : """
-         AND (
-           pref_match < ?
-           OR (pref_match = ? AND rating_count < ?)
-           OR (pref_match = ? AND rating_count = ? AND popular < ?)
-           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating < ?)
-           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating = ? AND created_at < ?)
-           OR (pref_match = ? AND rating_count = ? AND popular = ? AND rating = ? AND created_at = ? AND id < ?)
-         )""";
-    String sql = """
-        WITH ranked AS (
-          SELECT p.id,
-            CASE
-              WHEN cardinality(?::text[]) = 0 THEN 0
-              WHEN lower(p.role_tag) = ANY(?::text[]) THEN 1
-              WHEN EXISTS (
-                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.roles, '[]'::jsonb)) role
-                WHERE lower(role) = ANY(?::text[])
-              ) THEN 1
-              WHEN EXISTS (
-                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genre_terms, '[]'::jsonb)) term
-                WHERE lower(term) = ANY(?::text[])
-              ) THEN 1
-              WHEN EXISTS (
-                SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.genres, '[]'::jsonb)) genre
-                WHERE lower(genre) = ANY(?::text[])
-              ) THEN 1
-              ELSE 0
-            END AS pref_match,
-            u.rating_count,
-            (u.followers + p.loves) AS popular,
-            u.rating,
-            p.created_at
-          FROM community_posts p
-          JOIN users u ON u.id = p.musician_id
-          WHERE (u.is_private = FALSE OR (? <> '' AND u.id = ?))
-        """ + extra + """
-        )
-        SELECT id, pref_match, rating_count, popular, rating, created_at
-        FROM ranked
-        WHERE TRUE
-        """ + cursorSql + """
-        ORDER BY pref_match DESC, rating_count DESC, popular DESC, rating DESC, created_at DESC, id DESC
-        LIMIT ?
-        """;
-    String[] terms = preferences == null ? new String[0] : preferences;
-    return jdbc.query((Connection con) -> {
-      PreparedStatement ps = con.prepareStatement(sql);
-      Array array = con.createArrayOf("text", terms);
-      int i = 1;
-      for (int n = 0; n < 5; n++) ps.setArray(i++, array);
-      ps.setString(i++, viewer);
-      ps.setString(i++, viewer);
-      if ("following".equals(filter)) ps.setString(i++, viewer);
-      if (cursor != null) i = cursor.bind(ps, i);
-      ps.setInt(i, limit);
-      return ps;
-    }, (rs, n) -> new FeedSlot(
-        rs.getString("id"),
-        rs.getInt("pref_match"),
-        rs.getInt("rating_count"),
-        rs.getInt("popular"),
-        rs.getBigDecimal("rating"),
-        rs.getTimestamp("created_at").toInstant().toEpochMilli()));
+    Set<String> prefs = new java.util.HashSet<>();
+    if (preferences != null) {
+      for (String preference : preferences) {
+        if (preference != null && !preference.isBlank()) prefs.add(preference.toLowerCase(Locale.ROOT));
+      }
+    }
+    Set<String> following = Set.of();
+    if ("following".equals(filter) && !viewer.isBlank()) {
+      following = new java.util.HashSet<>();
+      Query query = Query.query(Criteria.where("followerId").is(viewer));
+      for (Document row : mongo.find(query, Document.class, "user_follows")) following.add(str(row.get("musicianId")));
+    }
+    Map<String, Document> users = new LinkedHashMap<>();
+    for (Document user : mongo.findAll(Document.class, "users")) users.put(idOf(user), user);
+    List<FeedSlot> slots = new ArrayList<>();
+    for (Document post : mongo.findAll(Document.class, "community_posts")) {
+      Document user = users.get(str(post.get("musicianId")));
+      if (user == null || !visible(user, viewer) || !matches(filter, post, user, following)) continue;
+      int preferred = prefs.isEmpty() ? 0 : (matchesPreference(post, user, prefs) ? 1 : 0);
+      int ratingCount = num(user.get("ratingCount"));
+      int popular = num(user.get("followers")) + num(post.get("loves"));
+      BigDecimal rating = decimal(user.get("rating"));
+      long created = epoch(post.get("createdAt"));
+      slots.add(new FeedSlot(idOf(post), preferred, ratingCount, popular, rating, created));
+    }
+    slots.sort(FEED_ORDER);
+    if (cursor != null) slots.removeIf(slot -> !after(slot, cursor));
+    if (slots.size() > limit) return new ArrayList<>(slots.subList(0, limit));
+    return slots;
   }
 
   public List<Map<String, Object>> postsByIds(List<String> ids) {
-    return byIds("SELECT * FROM community_posts WHERE id IN (", ids, (rs, n) -> post(rs));
+    return byIds("community_posts", ids, this::post);
   }
 
   public List<Map<String, Object>> usersByIds(List<String> ids) {
-    return byIds("SELECT * FROM users WHERE id IN (", ids, (rs, n) -> user(rs));
-  }
-
-  private List<Map<String, Object>> byIds(String prefix, List<String> ids, org.springframework.jdbc.core.RowMapper<Map<String, Object>> mapper) {
-    if (ids.isEmpty()) return List.of();
-    String marks = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
-    return jdbc.query(prefix + marks + ")", mapper, ids.toArray());
-  }
-
-  private static String roleFilter(String role) {
-    return """
-         AND (
-           lower(p.role_tag) = '%s'
-           OR EXISTS (
-             SELECT 1 FROM jsonb_array_elements_text(COALESCE(u.roles, '[]'::jsonb)) role
-             WHERE lower(role) = '%s'
-           )
-         )""".formatted(role, role);
+    return byIds("users", ids, this::user);
   }
 
   public String publicName(String id) {
-    List<String> names = jdbc.query("SELECT name FROM users WHERE id = ?", (rs, n) -> rs.getString("name"), id);
-    return names.isEmpty() ? null : names.get(0);
+    Document user = find("users", id);
+    return user == null ? null : strOrNull(user.get("name"));
   }
 
-  @Transactional
   public void upsertUser(Map<String, Object> user) {
-    jdbc.update(
-        """
-        INSERT INTO users (
-          id, email, google_sub, avatar_url, cover_url, profile_completed,
-          name, name_bn, city, city_bn, city_terms,
-          roles, instruments, instruments_bn, genres, genres_bn, genre_terms,
-          languages, languages_bn, language_terms, bio, bio_bn,
-          price_from_bdt, turnaround_days, years, open_to_work,
-          mood, mood_bn, mood_terms, followers, rating, rating_count,
-          phone, bkash_number, is_private, gender
-        ) VALUES (
-          ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, CAST(? AS jsonb),
-          CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb),
-          CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), ?, ?,
-          ?, ?, ?, ?,
-          CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), ?, ?, ?,
-          ?, ?, ?, ?
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          email = EXCLUDED.email,
-          google_sub = EXCLUDED.google_sub,
-          avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-          cover_url = COALESCE(EXCLUDED.cover_url, users.cover_url),
-          profile_completed = EXCLUDED.profile_completed,
-          name = EXCLUDED.name,
-          name_bn = EXCLUDED.name_bn,
-          city = EXCLUDED.city,
-          city_bn = EXCLUDED.city_bn,
-          city_terms = EXCLUDED.city_terms,
-          roles = EXCLUDED.roles,
-          instruments = EXCLUDED.instruments,
-          instruments_bn = EXCLUDED.instruments_bn,
-          genres = EXCLUDED.genres,
-          genres_bn = EXCLUDED.genres_bn,
-          genre_terms = EXCLUDED.genre_terms,
-          bio = EXCLUDED.bio,
-          bio_bn = EXCLUDED.bio_bn,
-          price_from_bdt = EXCLUDED.price_from_bdt,
-          turnaround_days = EXCLUDED.turnaround_days,
-          open_to_work = EXCLUDED.open_to_work,
-          followers = EXCLUDED.followers,
-          rating = EXCLUDED.rating,
-          rating_count = EXCLUDED.rating_count,
-          phone = EXCLUDED.phone,
-          bkash_number = EXCLUDED.bkash_number,
-          is_private = EXCLUDED.is_private,
-          gender = EXCLUDED.gender,
-          selfie_verified = CASE
-            WHEN EXCLUDED.avatar_url IS NOT NULL AND EXCLUDED.avatar_url IS DISTINCT FROM users.avatar_url THEN FALSE
-            ELSE users.selfie_verified
-          END
-        """,
-        user.get("id"),
-        user.get("email"),
-        user.get("googleSub"),
-        user.get("avatarUrl"),
-        user.get("coverUrl"),
-        Boolean.TRUE.equals(user.get("profileCompleted")),
-        user.get("name"),
-        user.get("nameBn"),
-        user.get("city"),
-        user.get("cityBn"),
-        JsonText.array(strings(user.get("cityTerms"))),
-        JsonText.array(strings(user.get("roles"))),
-        JsonText.array(strings(user.get("instruments"))),
-        JsonText.array(strings(user.get("instrumentsBn"))),
-        JsonText.array(strings(user.get("genres"))),
-        JsonText.array(strings(user.get("genresBn"))),
-        JsonText.array(strings(user.get("genreTerms"))),
-        JsonText.array(strings(user.get("languages"))),
-        JsonText.array(strings(user.get("languagesBn"))),
-        JsonText.array(strings(user.get("languageTerms"))),
-        str(user.get("bio")),
-        str(user.get("bioBn")),
-        user.get("priceFromBdt"),
-        user.get("turnaroundDays"),
-        user.get("years"),
-        user.get("openToWork") == null || Boolean.TRUE.equals(user.get("openToWork")),
-        JsonText.array(strings(user.get("mood"))),
-        JsonText.array(strings(user.get("moodBn"))),
-        JsonText.array(strings(user.get("moodTerms"))),
-        num(user.get("followers")),
-        user.get("rating") instanceof Number n ? n.doubleValue() : 5.0,
-        num(user.get("ratingCount")),
-        user.get("phone"),
-        user.get("bkashNumber"),
-        Boolean.TRUE.equals(user.get("isPrivate")),
-        user.get("gender"));
+    String id = str(user.get("id"));
+    Document existing = find("users", id);
+    Document doc = toDoc(id, user);
+    if (existing == null) {
+      doc.put("selfieVerified", false);
+      doc.putIfAbsent("feedPreferences", List.of());
+      doc.putIfAbsent("createdAt", new Date());
+    } else {
+      String oldAvatar = strOrNull(existing.get("avatarUrl"));
+      String newAvatar = strOrNull(user.get("avatarUrl"));
+      if (newAvatar == null) copy(doc, existing, "avatarUrl");
+      if (strOrNull(user.get("coverUrl")) == null) copy(doc, existing, "coverUrl");
+      boolean avatarChanged = newAvatar != null && (oldAvatar == null || !newAvatar.equals(oldAvatar));
+      doc.put("selfieVerified", !avatarChanged && bool(existing.get("selfieVerified")));
+      if (!user.containsKey("feedPreferences")) copy(doc, existing, "feedPreferences");
+      if (existing.get("createdAt") != null) doc.put("createdAt", existing.get("createdAt"));
+    }
+    mongo.save(doc, "users");
   }
 
   public void updateGender(String userId, String gender) {
-    jdbc.update("UPDATE users SET gender = ? WHERE id = ?", gender, userId);
+    Update update = new Update();
+    if ("female".equals(gender) || "male".equals(gender)) update.set("gender", gender);
+    else update.unset("gender");
+    mongo.updateFirst(byId(userId), update, "users");
   }
 
   public void updateVisibility(String userId, boolean isPrivate) {
-    jdbc.update("UPDATE users SET is_private = ? WHERE id = ?", isPrivate, userId);
+    mongo.updateFirst(byId(userId), new Update().set("isPrivate", isPrivate), "users");
   }
 
   public void updatePayment(String userId, String phone, String bkash) {
-    jdbc.update("UPDATE users SET phone = ?, bkash_number = ? WHERE id = ?", blankToNull(phone), blankToNull(bkash), userId);
+    Update update = new Update();
+    optional(update, "phone", phone);
+    optional(update, "bkashNumber", bkash);
+    mongo.updateFirst(byId(userId), update, "users");
+  }
+
+  public void updateSocialLinks(String userId, String twitter, String facebook, String spotify, String youtube) {
+    Update update = new Update();
+    optional(update, "twitterUrl", twitter);
+    optional(update, "facebookUrl", facebook);
+    optional(update, "spotifyUrl", spotify);
+    optional(update, "youtubeChannelUrl", youtube);
+    mongo.updateFirst(byId(userId), update, "users");
   }
 
   public void updateFeedPreferences(String userId, List<String> preferences) {
-    jdbc.update("UPDATE users SET feed_preferences = CAST(? AS jsonb) WHERE id = ?", JsonText.array(preferences), userId);
+    mongo.updateFirst(byId(userId), new Update().set("feedPreferences", preferences == null ? List.of() : preferences), "users");
   }
 
   public void verifySelfie(String userId, String avatarUrl) {
-    jdbc.update("UPDATE users SET avatar_url = ?, selfie_verified = TRUE WHERE id = ?", avatarUrl, userId);
+    mongo.updateFirst(byId(userId), new Update().set("avatarUrl", avatarUrl).set("selfieVerified", true), "users");
   }
 
   public void updatePhotos(String userId, String avatar, String cover, Integer position) {
-    if (avatar != null) {
-      jdbc.update("UPDATE users SET avatar_url = ?, selfie_verified = FALSE WHERE id = ?", avatar, userId);
-    }
-    if (cover != null) jdbc.update("UPDATE users SET cover_url = ? WHERE id = ?", cover, userId);
-    if (position != null) {
-      int clamped = Math.max(0, Math.min(100, position));
-      jdbc.update("UPDATE users SET cover_position_y = ? WHERE id = ?", clamped, userId);
-    }
+    if (avatar == null && cover == null && position == null) return;
+    Update update = new Update();
+    if (avatar != null) update.set("avatarUrl", avatar).set("selfieVerified", false);
+    if (cover != null) update.set("coverUrl", cover);
+    if (position != null) update.set("coverPositionY", Math.max(0, Math.min(100, position)));
+    mongo.updateFirst(byId(userId), update, "users");
   }
 
   public void insertShowcase(Map<String, Object> item) {
-    jdbc.update(
-        """
-        INSERT INTO showcase_items (
-          id, musician_id, kind, title, title_bn, youtube_id, audio_src, duration, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        item.get("id"), item.get("musicianId"), item.get("kind"), item.get("title"), item.get("titleBn"),
-        item.get("youtubeId"), item.get("audioSrc"), item.get("duration"), timestamp(str(item.get("createdAt"))));
+    mongo.save(toDoc(str(item.get("id")), item), "showcase_items");
   }
 
   public void insertPost(Map<String, Object> post) {
-    jdbc.update(
-        """
-        INSERT INTO community_posts (
-          id, musician_id, category, title, title_bn, text, text_bn,
-          role_tag, price_bdt, youtube_id, audio_src, loves, loved_by, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)
-        """,
-        post.get("id"), post.get("musicianId"), post.get("category"), post.get("title"), post.get("titleBn"),
-        post.get("text"), post.get("textBn"), post.get("roleTag"), post.get("priceBdt"), post.get("youtubeId"),
-        post.get("audioSrc"), num(post.get("loves")), JsonText.array(strings(post.get("lovedBy"))),
-        timestamp(str(post.get("createdAt"))));
+    Document doc = toDoc(str(post.get("id")), post);
+    doc.put("loves", num(post.get("loves")));
+    doc.put("lovedBy", strings(post.get("lovedBy")));
+    mongo.save(doc, "community_posts");
   }
 
   public void updatePost(String postId, String musicianId, String category, String title, String text, String role, Integer price, String youtube, String audio) {
-    jdbc.update(
-        """
-        UPDATE community_posts
-        SET category = ?, title = ?, title_bn = ?, text = ?, text_bn = ?, role_tag = ?,
-            price_bdt = ?, youtube_id = ?, audio_src = ?
-        WHERE id = ? AND musician_id = ?
-        """,
-        category, title, title, text, text, role, price, youtube, audio, postId, musicianId);
+    Update update = new Update()
+        .set("category", category)
+        .set("title", title)
+        .set("titleBn", title)
+        .set("text", text)
+        .set("textBn", text)
+        .set("roleTag", role);
+    optional(update, "priceBdt", price);
+    optional(update, "youtubeId", youtube);
+    optional(update, "audioSrc", audio);
+    mongo.updateFirst(Query.query(Criteria.where("_id").is(postId).and("musicianId").is(musicianId)), update, "community_posts");
   }
 
   public void deletePost(String postId, String musicianId) {
-    jdbc.update("DELETE FROM community_posts WHERE id = ? AND musician_id = ?", postId, musicianId);
+    mongo.remove(Query.query(Criteria.where("_id").is(postId).and("musicianId").is(musicianId)), "community_posts");
   }
 
   public void toggleLove(String postId, String userId) {
-    List<Map<String, Object>> rows = jdbc.query(
-        "SELECT loves, loved_by::text AS loved_by FROM community_posts WHERE id = ?",
-        (rs, n) -> Map.of("loves", rs.getInt("loves"), "lovedBy", rs.getString("loved_by")),
-        postId);
-    if (rows.isEmpty()) return;
-    List<String> loved = new ArrayList<>(JsonText.strings(str(rows.get(0).get("lovedBy"))));
+    Document post = find("community_posts", postId);
+    if (post == null) return;
+    List<String> loved = new ArrayList<>(strings(post.get("lovedBy")));
     boolean already = loved.contains(userId);
     if (already) loved.remove(userId);
     else loved.add(userId);
-    int loves = Math.max(0, num(rows.get(0).get("loves")) + (already ? -1 : 1));
-    jdbc.update("UPDATE community_posts SET loves = ?, loved_by = CAST(? AS jsonb) WHERE id = ?", loves, JsonText.array(loved), postId);
+    int loves = Math.max(0, num(post.get("loves")) + (already ? -1 : 1));
+    mongo.updateFirst(byId(postId), new Update().set("loves", loves).set("lovedBy", loved), "community_posts");
   }
 
   public void toggleFollow(String followerId, String musicianId) {
-    Integer existing = jdbc.queryForObject(
-        "SELECT COUNT(*) FROM user_follows WHERE follower_id = ? AND musician_id = ?",
-        Integer.class, followerId, musicianId);
-    if (existing != null && existing > 0) {
-      jdbc.update("DELETE FROM user_follows WHERE follower_id = ? AND musician_id = ?", followerId, musicianId);
+    Query existing = Query.query(Criteria.where("followerId").is(followerId).and("musicianId").is(musicianId));
+    if (mongo.exists(existing, "user_follows")) {
+      mongo.remove(existing, "user_follows");
     } else {
-      jdbc.update("INSERT INTO user_follows (follower_id, musician_id) VALUES (?, ?) ON CONFLICT DO NOTHING", followerId, musicianId);
+      Document follow = new Document("_id", followerId + ":" + musicianId)
+          .append("followerId", followerId)
+          .append("musicianId", musicianId);
+      mongo.save(follow, "user_follows");
     }
-    jdbc.update(
-        "UPDATE users SET followers = (SELECT COUNT(*)::int FROM user_follows WHERE musician_id = ?) WHERE id = ?",
-        musicianId, musicianId);
+    long count = mongo.count(Query.query(Criteria.where("musicianId").is(musicianId)), "user_follows");
+    mongo.updateFirst(byId(musicianId), new Update().set("followers", (int) count), "users");
   }
 
   public void rate(String raterId, String musicianId, int rating) {
-    jdbc.update(
-        """
-        INSERT INTO user_ratings (rater_id, musician_id, rating, updated_at)
-        VALUES (?, ?, ?, NOW())
-        ON CONFLICT (rater_id, musician_id) DO UPDATE SET rating = EXCLUDED.rating, updated_at = NOW()
-        """,
-        raterId, musicianId, rating);
-    jdbc.update(
-        """
-        UPDATE users SET
-          rating_count = (SELECT COUNT(*)::int FROM user_ratings WHERE musician_id = ?),
-          rating = COALESCE((SELECT ROUND(AVG(rating)::numeric, 1) FROM user_ratings WHERE musician_id = ?), 5.0)
-        WHERE id = ?
-        """,
-        musicianId, musicianId, musicianId);
+    saveRating(raterId, musicianId, rating);
+    refreshRating(musicianId, false);
   }
 
   public void insertMessage(Map<String, Object> message) {
-    jdbc.update(
-        """
-        INSERT INTO chat_messages (
-          id, from_id, to_id, text, attachment_url, attachment_kind, attachment_name, post_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        message.get("id"), message.get("fromId"), message.get("toId"), str(message.get("text")),
-        message.get("attachmentUrl"), message.get("attachmentKind"), message.get("attachmentName"),
-        message.get("postId"), timestamp(str(message.get("createdAt"))));
+    Document doc = toDoc(str(message.get("id")), message);
+    if (!doc.containsKey("text")) doc.put("text", "");
+    mongo.save(doc, "chat_messages");
   }
 
   public void markSeen(String viewerId, String peerId) {
-    jdbc.update(
-        "UPDATE chat_messages SET read_at = NOW() WHERE to_id = ? AND from_id = ? AND read_at IS NULL",
-        viewerId, peerId);
+    Query query = Query.query(Criteria.where("toId").is(viewerId).and("fromId").is(peerId).and("readAt").is(null));
+    mongo.updateMulti(query, new Update().set("readAt", new Date()), "chat_messages");
   }
 
   public void insertOrder(Map<String, Object> order) {
-    jdbc.update(
-        """
-        INSERT INTO service_orders (
-          id, buyer_id, musician_id, title, description, price_bdt, delivery_days, status,
-          bkash_trx_id, payment_status, payment_submitted_at,
-          attachment_url, attachment_kind, attachment_name, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        order.get("id"), order.get("buyerId"), order.get("musicianId"), order.get("title"),
-        str(order.get("description")), num(order.get("priceBdt")), num(order.get("deliveryDays")),
-        order.get("status"), order.get("bkashTrxId"), order.get("paymentStatus") == null ? "none" : order.get("paymentStatus"),
-        order.get("paymentSubmittedAt") == null ? null : timestamp(str(order.get("paymentSubmittedAt"))),
-        order.get("attachmentUrl"), order.get("attachmentKind"), order.get("attachmentName"),
-        timestamp(str(order.get("createdAt"))));
+    Document doc = toDoc(str(order.get("id")), order);
+    if (!doc.containsKey("description")) doc.put("description", "");
+    if (!doc.containsKey("paymentStatus")) doc.put("paymentStatus", "none");
+    mongo.save(doc, "service_orders");
   }
 
   public boolean submitTrx(String orderId, String buyerId, String trxId) {
-    return jdbc.update(
-        """
-        UPDATE service_orders
-        SET bkash_trx_id = ?, payment_status = 'submitted', payment_submitted_at = NOW(),
-            payment_confirmed_at = NULL, payment_dispute_note = NULL
-        WHERE id = ? AND buyer_id = ? AND payment_status <> 'confirmed'
-        """,
-        trxId, orderId, buyerId) > 0;
+    Query query = Query.query(Criteria.where("_id").is(orderId).and("buyerId").is(buyerId).and("paymentStatus").ne("confirmed"));
+    Update update = new Update()
+        .set("bkashTrxId", trxId)
+        .set("paymentStatus", "submitted")
+        .set("paymentSubmittedAt", new Date())
+        .unset("paymentConfirmedAt")
+        .unset("paymentDisputeNote");
+    return mongo.updateFirst(query, update, "service_orders").getMatchedCount() > 0;
   }
 
   public boolean confirmTrx(String orderId, String musicianId) {
-    return jdbc.update(
-        """
-        UPDATE service_orders
-        SET payment_status = 'confirmed', payment_confirmed_at = NOW(), payment_dispute_note = NULL
-        WHERE id = ? AND musician_id = ? AND payment_status = 'submitted' AND bkash_trx_id IS NOT NULL
-        """,
-        orderId, musicianId) > 0;
+    Query query = Query.query(Criteria.where("_id").is(orderId)
+        .and("musicianId").is(musicianId)
+        .and("paymentStatus").is("submitted")
+        .and("bkashTrxId").ne(null));
+    Update update = new Update().set("paymentStatus", "confirmed").set("paymentConfirmedAt", new Date()).unset("paymentDisputeNote");
+    return mongo.updateFirst(query, update, "service_orders").getMatchedCount() > 0;
   }
 
   public boolean disputeTrx(String orderId, String musicianId, String note) {
-    return jdbc.update(
-        """
-        UPDATE service_orders
-        SET payment_status = 'disputed', payment_dispute_note = ?, payment_confirmed_at = NULL
-        WHERE id = ? AND musician_id = ? AND payment_status = 'submitted'
-        """,
-        blankToNull(note), orderId, musicianId) > 0;
+    Query query = Query.query(Criteria.where("_id").is(orderId).and("musicianId").is(musicianId).and("paymentStatus").is("submitted"));
+    Update update = new Update().set("paymentStatus", "disputed").unset("paymentConfirmedAt");
+    String clean = blankToNull(note);
+    if (clean == null) update.unset("paymentDisputeNote");
+    else update.set("paymentDisputeNote", clean);
+    return mongo.updateFirst(query, update, "service_orders").getMatchedCount() > 0;
   }
 
   public void markDelivered(String orderId, String musicianId, String note, String url, String kind, String name) {
-    jdbc.update(
-        """
-        UPDATE service_orders
-        SET status = 'delivered',
-            delivery_note = COALESCE(?, delivery_note),
-            delivery_attachment_url = COALESCE(?, delivery_attachment_url),
-            delivery_attachment_kind = COALESCE(?, delivery_attachment_kind),
-            delivery_attachment_name = COALESCE(?, delivery_attachment_name),
-            delivered_at = NOW()
-        WHERE id = ? AND musician_id = ? AND status = 'active'
-        """,
-        blankToNull(note), blankToNull(url), kind, blankToNull(name), orderId, musicianId);
+    Document order = find("service_orders", orderId);
+    if (order == null || !musicianId.equals(str(order.get("musicianId"))) || !"active".equals(str(order.get("status")))) return;
+    Update update = new Update().set("status", "delivered").set("deliveredAt", new Date());
+    String cleanNote = blankToNull(note);
+    String cleanUrl = blankToNull(url);
+    if (cleanNote != null) update.set("deliveryNote", cleanNote);
+    if (cleanUrl != null) {
+      update.set("deliveryAttachmentUrl", cleanUrl);
+      if (kind != null) update.set("deliveryAttachmentKind", kind);
+    }
+    String cleanName = blankToNull(name);
+    if (cleanName != null) update.set("deliveryAttachmentName", cleanName);
+    mongo.updateFirst(byId(orderId), update, "service_orders");
   }
 
   public String completeOrder(String orderId, String buyerId, int rating, String comment) {
-    List<Map<String, Object>> rows = jdbc.queryForList("SELECT * FROM service_orders WHERE id = ?", orderId);
-    if (rows.isEmpty()) return "Order not found.";
-    Map<String, Object> order = rows.get(0);
-    if (!buyerId.equals(String.valueOf(order.get("buyer_id")))) {
-      return "Only the user who placed this order can mark it as completed.";
-    }
-    String musicianId = String.valueOf(order.get("musician_id"));
+    Document order = find("service_orders", orderId);
+    if (order == null) return "Order not found.";
+    if (!buyerId.equals(str(order.get("buyerId")))) return "Only the user who placed this order can mark it as completed.";
+    String musicianId = str(order.get("musicianId"));
     int clamped = Math.max(1, Math.min(5, rating));
     String clean = comment == null || comment.isBlank() ? "Great collaboration and timely delivery!" : comment.trim();
-    jdbc.update(
-        "UPDATE service_orders SET status = 'completed', completed_at = NOW() WHERE id = ? AND buyer_id = ?",
-        orderId, buyerId);
+    mongo.updateFirst(
+        Query.query(Criteria.where("_id").is(orderId).and("buyerId").is(buyerId)),
+        new Update().set("status", "completed").set("completedAt", new Date()),
+        "service_orders");
     String reviewId = "rev-" + Long.toString(System.currentTimeMillis(), 36) + "-" + Integer.toString((int) (Math.random() * 36 * 36 * 36), 36);
-    jdbc.update(
-        """
-        INSERT INTO order_reviews (
-          id, order_id, buyer_id, musician_id, rating, comment, order_title, price_bdt, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        ON CONFLICT (order_id) DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW()
-        """,
-        reviewId, orderId, buyerId, musicianId, clamped, clean, str(order.get("title")), num(order.get("price_bdt")));
-    jdbc.update(
-        """
-        INSERT INTO user_ratings (rater_id, musician_id, rating, updated_at)
-        VALUES (?, ?, ?, NOW())
-        ON CONFLICT (rater_id, musician_id) DO UPDATE SET rating = EXCLUDED.rating, updated_at = NOW()
-        """,
-        buyerId, musicianId, clamped);
-    jdbc.update(
-        """
-        UPDATE users SET
-          rating_count = (
-            SELECT COUNT(*)::int FROM (
-              SELECT rater_id FROM user_ratings WHERE musician_id = ?
-              UNION ALL
-              SELECT buyer_id FROM order_reviews WHERE musician_id = ?
-            ) combined
-          ),
-          rating = COALESCE((
-            SELECT ROUND(AVG(rating)::numeric, 1) FROM (
-              SELECT rating FROM user_ratings WHERE musician_id = ?
-              UNION ALL
-              SELECT rating FROM order_reviews WHERE musician_id = ?
-            ) combined
-          ), 5.0)
-        WHERE id = ?
-        """,
-        musicianId, musicianId, musicianId, musicianId, musicianId);
+    Document existingReview = mongo.findOne(Query.query(Criteria.where("orderId").is(orderId)), Document.class, "order_reviews");
+    Document review = existingReview == null ? new Document() : existingReview;
+    if (existingReview == null) review.put("_id", reviewId);
+    review.put("id", review.get("_id"));
+    review.put("orderId", orderId);
+    review.put("buyerId", buyerId);
+    review.put("musicianId", musicianId);
+    review.put("rating", clamped);
+    review.put("comment", clean);
+    review.put("orderTitle", str(order.get("title")));
+    review.put("priceBdt", num(order.get("priceBdt")));
+    review.put("createdAt", new Date());
+    mongo.save(review, "order_reviews");
+    saveRating(buyerId, musicianId, clamped);
+    refreshRating(musicianId, true);
     return null;
   }
 
   public Map<String, Object> orderRow(String id) {
-    List<Map<String, Object>> rows = jdbc.queryForList(
-        "SELECT id, buyer_id, musician_id, title, price_bdt FROM service_orders WHERE id = ?", id);
-    return rows.isEmpty() ? null : rows.get(0);
+    Document order = find("service_orders", id);
+    if (order == null) return null;
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("id", idOf(order));
+    row.put("buyer_id", str(order.get("buyerId")));
+    row.put("musician_id", str(order.get("musicianId")));
+    row.put("title", str(order.get("title")));
+    row.put("price_bdt", num(order.get("priceBdt")));
+    return row;
   }
 
   public Map<String, Object> findContact(String id) {
-    List<Map<String, Object>> rows = jdbc.query(
-        "SELECT id, name, email FROM users WHERE id = ?",
-        (rs, n) -> {
-          Map<String, Object> row = new LinkedHashMap<>();
-          row.put("id", rs.getString("id"));
-          row.put("name", rs.getString("name"));
-          row.put("email", rs.getString("email"));
-          return row;
-        },
-        id);
-    return rows.isEmpty() ? null : rows.get(0);
+    Document user = find("users", id);
+    if (user == null) return null;
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("id", idOf(user));
+    row.put("name", str(user.get("name")));
+    row.put("email", str(user.get("email")));
+    return row;
   }
 
-  private static Map<String, Object> user(ResultSet rs) throws SQLException {
+  public List<Map<String, Object>> unseenMessages(Instant cutoff) {
+    Query query = Query.query(new Criteria().andOperator(
+            Criteria.where("readAt").is(null),
+            Criteria.where("emailNotifiedAt").is(null),
+            Criteria.where("createdAt").lte(Date.from(cutoff))))
+        .with(Sort.by(Sort.Direction.ASC, "createdAt"))
+        .limit(20);
+    List<Map<String, Object>> rows = new ArrayList<>();
+    for (Document message : mongo.find(query, Document.class, "chat_messages")) {
+      Document sender = find("users", str(message.get("fromId")));
+      Document recipient = find("users", str(message.get("toId")));
+      if (sender == null || recipient == null) continue;
+      Map<String, Object> row = new LinkedHashMap<>();
+      row.put("id", idOf(message));
+      row.put("text", str(message.get("text")));
+      row.put("to_id", str(message.get("toId")));
+      row.put("sender_name", str(sender.get("name")));
+      row.put("recipient_name", str(recipient.get("name")));
+      row.put("recipient_email", str(recipient.get("email")));
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  public void markMessageNotified(String id) {
+    mongo.updateFirst(byId(id), new Update().set("emailNotifiedAt", new Date()), "chat_messages");
+  }
+
+  private void saveRating(String raterId, String musicianId, int rating) {
+    Document existing = mongo.findOne(
+        Query.query(Criteria.where("raterId").is(raterId).and("musicianId").is(musicianId)),
+        Document.class,
+        "user_ratings");
+    Document doc = existing == null ? new Document("_id", raterId + ":" + musicianId) : existing;
+    doc.put("raterId", raterId);
+    doc.put("musicianId", musicianId);
+    doc.put("rating", rating);
+    doc.put("updatedAt", new Date());
+    mongo.save(doc, "user_ratings");
+  }
+
+  private void refreshRating(String musicianId, boolean includeReviews) {
+    List<Integer> ratings = new ArrayList<>();
+    for (Document row : mongo.find(Query.query(Criteria.where("musicianId").is(musicianId)), Document.class, "user_ratings")) {
+      ratings.add(num(row.get("rating")));
+    }
+    if (includeReviews) {
+      for (Document row : mongo.find(Query.query(Criteria.where("musicianId").is(musicianId)), Document.class, "order_reviews")) {
+        ratings.add(num(row.get("rating")));
+      }
+    }
+    double average = 5.0;
+    if (!ratings.isEmpty()) {
+      double sum = 0;
+      for (int rating : ratings) sum += rating;
+      average = BigDecimal.valueOf(sum / ratings.size()).setScale(1, RoundingMode.HALF_UP).doubleValue();
+    }
+    mongo.updateFirst(byId(musicianId), new Update().set("ratingCount", ratings.size()).set("rating", average), "users");
+  }
+
+  private <T> List<T> mapAll(String collection, java.util.function.Function<Document, T> mapper, Sort sort) {
+    List<T> rows = new ArrayList<>();
+    for (Document doc : mongo.find(new Query().with(sort), Document.class, collection)) rows.add(mapper.apply(doc));
+    return rows;
+  }
+
+  private List<Map<String, Object>> byIds(String collection, List<String> ids, java.util.function.Function<Document, Map<String, Object>> mapper) {
+    if (ids.isEmpty()) return List.of();
+    List<Map<String, Object>> rows = new ArrayList<>();
+    for (Document doc : mongo.find(Query.query(Criteria.where("_id").in(ids)), Document.class, collection)) rows.add(mapper.apply(doc));
+    return rows;
+  }
+
+  private Document find(String collection, String id) {
+    if (id == null || id.isBlank()) return null;
+    return mongo.findById(id, Document.class, collection);
+  }
+
+  private static Query byId(String id) {
+    return Query.query(Criteria.where("_id").is(id));
+  }
+
+  private static Sort createdDesc() {
+    return Sort.by(Sort.Direction.DESC, "createdAt");
+  }
+
+  private static boolean visible(Document user, String viewer) {
+    return !bool(user.get("isPrivate")) || (!viewer.isBlank() && viewer.equals(idOf(user)));
+  }
+
+  private static boolean matches(String filter, Document post, Document user, Set<String> following) {
+    return switch (filter == null ? "" : filter) {
+      case "following" -> following.contains(str(post.get("musicianId")));
+      case "vocal" -> hasRole(post, user, "vocalist");
+      case "guitar" -> hasRole(post, user, "guitarist");
+      case "percussion" -> hasRole(post, user, "percussion");
+      case "folk" -> lower(strings(user.get("genreTerms"))).stream().anyMatch(term -> term.equals("folk") || term.equals("লোক"));
+      default -> true;
+    };
+  }
+
+  private static boolean hasRole(Document post, Document user, String role) {
+    if (role.equals(lower(str(post.get("roleTag"))))) return true;
+    return lower(strings(user.get("roles"))).contains(role);
+  }
+
+  private static boolean matchesPreference(Document post, Document user, Set<String> prefs) {
+    if (prefs.contains(lower(str(post.get("roleTag"))))) return true;
+    for (String role : lower(strings(user.get("roles")))) if (prefs.contains(role)) return true;
+    for (String term : lower(strings(user.get("genreTerms")))) if (prefs.contains(term)) return true;
+    for (String genre : lower(strings(user.get("genres")))) if (prefs.contains(genre)) return true;
+    return false;
+  }
+
+  private static boolean after(FeedSlot slot, FeedCursor cursor) {
+    int preferred = Integer.compare(slot.preferred(), cursor.preferred());
+    if (preferred != 0) return preferred < 0;
+    int ratingCount = Integer.compare(slot.ratingCount(), cursor.ratingCount());
+    if (ratingCount != 0) return ratingCount < 0;
+    int popular = Integer.compare(slot.popular(), cursor.popular());
+    if (popular != 0) return popular < 0;
+    int rating = slot.rating().compareTo(cursor.rating());
+    if (rating != 0) return rating < 0;
+    int created = Long.compare(slot.createdAtEpoch(), cursor.createdAtEpoch());
+    if (created != 0) return created < 0;
+    return slot.id().compareTo(cursor.id()) < 0;
+  }
+
+  private static final Comparator<FeedSlot> FEED_ORDER = (left, right) -> {
+    int preferred = Integer.compare(right.preferred(), left.preferred());
+    if (preferred != 0) return preferred;
+    int ratingCount = Integer.compare(right.ratingCount(), left.ratingCount());
+    if (ratingCount != 0) return ratingCount;
+    int popular = Integer.compare(right.popular(), left.popular());
+    if (popular != 0) return popular;
+    int rating = right.rating().compareTo(left.rating());
+    if (rating != 0) return rating;
+    int created = Long.compare(right.createdAtEpoch(), left.createdAtEpoch());
+    if (created != 0) return created;
+    return right.id().compareTo(left.id());
+  };
+
+  private Map<String, Object> user(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    put(row, "email", rs.getString("email"));
-    put(row, "googleSub", rs.getString("google_sub"));
-    put(row, "avatarUrl", rs.getString("avatar_url"));
-    put(row, "coverUrl", rs.getString("cover_url"));
-    int cover = rs.getInt("cover_position_y");
-    row.put("coverPositionY", rs.wasNull() ? 50 : cover);
-    put(row, "phone", rs.getString("phone"));
-    put(row, "bkashNumber", rs.getString("bkash_number"));
-    row.put("isPrivate", rs.getBoolean("is_private"));
-    row.put("selfieVerified", rs.getBoolean("selfie_verified"));
-    row.put("feedPreferences", list(rs, "feed_preferences"));
-    row.put("profileCompleted", rs.getBoolean("profile_completed"));
-    row.put("name", rs.getString("name"));
-    row.put("nameBn", rs.getString("name_bn"));
-    row.put("city", rs.getString("city"));
-    row.put("cityBn", rs.getString("city_bn"));
-    row.put("cityTerms", list(rs, "city_terms"));
-    List<String> roles = listOrNull(rs, "roles");
+    row.put("id", idOf(doc));
+    put(row, "email", strOrNull(doc.get("email")));
+    put(row, "googleSub", strOrNull(doc.get("googleSub")));
+    put(row, "avatarUrl", strOrNull(doc.get("avatarUrl")));
+    put(row, "coverUrl", strOrNull(doc.get("coverUrl")));
+    row.put("coverPositionY", doc.get("coverPositionY") == null ? 50 : num(doc.get("coverPositionY")));
+    put(row, "phone", strOrNull(doc.get("phone")));
+    put(row, "bkashNumber", strOrNull(doc.get("bkashNumber")));
+    put(row, "twitterUrl", strOrNull(doc.get("twitterUrl")));
+    put(row, "facebookUrl", strOrNull(doc.get("facebookUrl")));
+    put(row, "spotifyUrl", strOrNull(doc.get("spotifyUrl")));
+    put(row, "youtubeChannelUrl", strOrNull(doc.get("youtubeChannelUrl")));
+    row.put("isPrivate", bool(doc.get("isPrivate")));
+    row.put("selfieVerified", bool(doc.get("selfieVerified")));
+    row.put("feedPreferences", strings(doc.get("feedPreferences")));
+    row.put("profileCompleted", bool(doc.get("profileCompleted")));
+    String accountKind = strOrNull(doc.get("accountKind"));
+    if ("agency".equals(accountKind) || "member".equals(accountKind) || "musician".equals(accountKind)) {
+      row.put("accountKind", accountKind);
+    }
+    row.put("name", str(doc.get("name")));
+    row.put("nameBn", str(doc.get("nameBn")));
+    row.put("city", str(doc.get("city")));
+    row.put("cityBn", str(doc.get("cityBn")));
+    row.put("cityTerms", strings(doc.get("cityTerms")));
+    List<String> roles = doc.get("roles") == null ? null : strings(doc.get("roles"));
     row.put("roles", roles == null ? List.of("vocalist") : roles);
-    String gender = rs.getString("gender");
+    String gender = strOrNull(doc.get("gender"));
     if ("female".equals(gender) || "male".equals(gender)) row.put("gender", gender);
-    row.put("instruments", list(rs, "instruments"));
-    row.put("instrumentsBn", list(rs, "instruments_bn"));
-    row.put("genres", list(rs, "genres"));
-    row.put("genresBn", list(rs, "genres_bn"));
-    row.put("genreTerms", list(rs, "genre_terms"));
-    List<String> languages = listOrNull(rs, "languages");
-    row.put("languages", languages == null ? List.of("Bangla", "English") : languages);
-    List<String> languagesBn = listOrNull(rs, "languages_bn");
-    row.put("languagesBn", languagesBn == null ? List.of("বাংলা", "ইংরেজি") : languagesBn);
-    List<String> languageTerms = listOrNull(rs, "language_terms");
-    row.put("languageTerms", languageTerms == null ? List.of("bangla", "বাংলা", "english", "ইংরেজি") : languageTerms);
-    row.put("bio", rs.getString("bio") == null ? "" : rs.getString("bio"));
-    row.put("bioBn", rs.getString("bio_bn") == null ? "" : rs.getString("bio_bn"));
-    putNum(row, "priceFromBdt", rs, "price_from_bdt");
-    putNum(row, "turnaroundDays", rs, "turnaround_days");
-    putNum(row, "years", rs, "years");
-    row.put("openToWork", rs.getBoolean("open_to_work"));
-    put(row, "vocalRange", rs.getString("vocal_range"));
-    put(row, "vocalRangeBn", rs.getString("vocal_range_bn"));
-    putList(row, "rangeTerms", rs, "range_terms");
-    put(row, "daw", rs.getString("daw"));
-    putList(row, "dawTerms", rs, "daw_terms");
-    row.put("mood", list(rs, "mood"));
-    row.put("moodBn", list(rs, "mood_bn"));
-    row.put("moodTerms", list(rs, "mood_terms"));
-    row.put("followers", rs.getInt("followers"));
-    row.put("rating", rs.getBigDecimal("rating") == null ? 5.0 : rs.getBigDecimal("rating").doubleValue());
-    row.put("ratingCount", rs.getInt("rating_count"));
+    row.put("instruments", strings(doc.get("instruments")));
+    row.put("instrumentsBn", strings(doc.get("instrumentsBn")));
+    row.put("genres", strings(doc.get("genres")));
+    row.put("genresBn", strings(doc.get("genresBn")));
+    row.put("genreTerms", strings(doc.get("genreTerms")));
+    row.put("languages", doc.get("languages") == null ? List.of("Bangla", "English") : strings(doc.get("languages")));
+    row.put("languagesBn", doc.get("languagesBn") == null ? List.of("বাংলা", "ইংরেজি") : strings(doc.get("languagesBn")));
+    row.put("languageTerms", doc.get("languageTerms") == null
+        ? List.of("bangla", "বাংলা", "english", "ইংরেজি")
+        : strings(doc.get("languageTerms")));
+    row.put("bio", doc.get("bio") == null ? "" : str(doc.get("bio")));
+    row.put("bioBn", doc.get("bioBn") == null ? "" : str(doc.get("bioBn")));
+    putNum(row, "priceFromBdt", doc.get("priceFromBdt"));
+    putNum(row, "turnaroundDays", doc.get("turnaroundDays"));
+    putNum(row, "years", doc.get("years"));
+    row.put("openToWork", bool(doc.get("openToWork")));
+    put(row, "vocalRange", strOrNull(doc.get("vocalRange")));
+    put(row, "vocalRangeBn", strOrNull(doc.get("vocalRangeBn")));
+    if (doc.get("rangeTerms") != null) row.put("rangeTerms", strings(doc.get("rangeTerms")));
+    put(row, "daw", strOrNull(doc.get("daw")));
+    if (doc.get("dawTerms") != null) row.put("dawTerms", strings(doc.get("dawTerms")));
+    row.put("mood", strings(doc.get("mood")));
+    row.put("moodBn", strings(doc.get("moodBn")));
+    row.put("moodTerms", strings(doc.get("moodTerms")));
+    row.put("followers", num(doc.get("followers")));
+    row.put("rating", doc.get("rating") == null ? 5.0 : decimal(doc.get("rating")).doubleValue());
+    row.put("ratingCount", num(doc.get("ratingCount")));
     return row;
   }
 
-  private static Map<String, Object> collection(ResultSet rs) throws SQLException {
+  private Map<String, Object> collection(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    row.put("musicianId", rs.getString("musician_id"));
-    row.put("kind", rs.getString("kind"));
-    row.put("title", rs.getString("title"));
-    row.put("titleBn", rs.getString("title_bn"));
-    put(row, "youtubeId", rs.getString("youtube_id"));
-    put(row, "audioSrc", rs.getString("audio_src"));
-    row.put("duration", rs.getString("duration") == null ? "Audio" : rs.getString("duration"));
-    row.put("createdAt", iso(rs, "created_at"));
+    row.put("id", idOf(doc));
+    row.put("musicianId", str(doc.get("musicianId")));
+    row.put("kind", str(doc.get("kind")));
+    row.put("title", str(doc.get("title")));
+    row.put("titleBn", str(doc.get("titleBn")));
+    put(row, "youtubeId", strOrNull(doc.get("youtubeId")));
+    put(row, "audioSrc", strOrNull(doc.get("audioSrc")));
+    row.put("duration", strOrNull(doc.get("duration")) == null ? "Audio" : str(doc.get("duration")));
+    row.put("createdAt", iso(doc.get("createdAt")));
     return row;
   }
 
-  private static Map<String, Object> post(ResultSet rs) throws SQLException {
+  private Map<String, Object> post(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    row.put("musicianId", rs.getString("musician_id"));
-    row.put("category", rs.getString("category"));
-    row.put("title", rs.getString("title"));
-    row.put("titleBn", rs.getString("title_bn"));
-    row.put("text", rs.getString("text"));
-    row.put("textBn", rs.getString("text_bn"));
-    row.put("roleTag", rs.getString("role_tag"));
-    putNum(row, "priceBdt", rs, "price_bdt");
-    put(row, "youtubeId", rs.getString("youtube_id"));
-    put(row, "audioSrc", rs.getString("audio_src"));
-    row.put("loves", rs.getInt("loves"));
-    row.put("lovedBy", list(rs, "loved_by"));
-    row.put("createdAt", iso(rs, "created_at"));
+    row.put("id", idOf(doc));
+    row.put("musicianId", str(doc.get("musicianId")));
+    row.put("category", str(doc.get("category")));
+    row.put("title", str(doc.get("title")));
+    row.put("titleBn", str(doc.get("titleBn")));
+    row.put("text", str(doc.get("text")));
+    row.put("textBn", str(doc.get("textBn")));
+    row.put("roleTag", str(doc.get("roleTag")));
+    putNum(row, "priceBdt", doc.get("priceBdt"));
+    put(row, "youtubeId", strOrNull(doc.get("youtubeId")));
+    put(row, "audioSrc", strOrNull(doc.get("audioSrc")));
+    row.put("loves", num(doc.get("loves")));
+    row.put("lovedBy", strings(doc.get("lovedBy")));
+    row.put("createdAt", iso(doc.get("createdAt")));
     return row;
   }
 
-  private static Map<String, Object> message(ResultSet rs) throws SQLException {
+  private Map<String, Object> message(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    row.put("fromId", rs.getString("from_id"));
-    row.put("toId", rs.getString("to_id"));
-    row.put("text", rs.getString("text") == null ? "" : rs.getString("text"));
-    put(row, "attachmentUrl", rs.getString("attachment_url"));
-    put(row, "attachmentKind", rs.getString("attachment_kind"));
-    put(row, "attachmentName", rs.getString("attachment_name"));
-    put(row, "postId", rs.getString("post_id"));
-    row.put("createdAt", iso(rs, "created_at"));
-    put(row, "readAt", isoOrNull(rs, "read_at"));
-    put(row, "emailNotifiedAt", isoOrNull(rs, "email_notified_at"));
+    row.put("id", idOf(doc));
+    row.put("fromId", str(doc.get("fromId")));
+    row.put("toId", str(doc.get("toId")));
+    row.put("text", doc.get("text") == null ? "" : str(doc.get("text")));
+    put(row, "attachmentUrl", strOrNull(doc.get("attachmentUrl")));
+    put(row, "attachmentKind", strOrNull(doc.get("attachmentKind")));
+    put(row, "attachmentName", strOrNull(doc.get("attachmentName")));
+    put(row, "postId", strOrNull(doc.get("postId")));
+    row.put("createdAt", iso(doc.get("createdAt")));
+    put(row, "readAt", isoOrNull(doc.get("readAt")));
+    put(row, "emailNotifiedAt", isoOrNull(doc.get("emailNotifiedAt")));
     return row;
   }
 
-  private static Map<String, Object> order(ResultSet rs) throws SQLException {
+  private Map<String, Object> order(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    row.put("buyerId", rs.getString("buyer_id"));
-    row.put("musicianId", rs.getString("musician_id"));
-    row.put("title", rs.getString("title"));
-    row.put("description", rs.getString("description") == null ? "" : rs.getString("description"));
-    row.put("priceBdt", rs.getInt("price_bdt"));
-    row.put("deliveryDays", rs.getInt("delivery_days"));
-    row.put("status", rs.getString("status") == null ? "active" : rs.getString("status"));
-    put(row, "bkashTrxId", rs.getString("bkash_trx_id"));
-    String payment = rs.getString("payment_status");
+    row.put("id", idOf(doc));
+    row.put("buyerId", str(doc.get("buyerId")));
+    row.put("musicianId", str(doc.get("musicianId")));
+    row.put("title", str(doc.get("title")));
+    row.put("description", doc.get("description") == null ? "" : str(doc.get("description")));
+    row.put("priceBdt", num(doc.get("priceBdt")));
+    row.put("deliveryDays", num(doc.get("deliveryDays")));
+    String status = strOrNull(doc.get("status"));
+    row.put("status", status == null ? "active" : status);
+    put(row, "bkashTrxId", strOrNull(doc.get("bkashTrxId")));
+    String payment = strOrNull(doc.get("paymentStatus"));
     row.put("paymentStatus", "submitted".equals(payment) || "confirmed".equals(payment) || "disputed".equals(payment) ? payment : "none");
-    put(row, "paymentSubmittedAt", isoOrNull(rs, "payment_submitted_at"));
-    put(row, "paymentConfirmedAt", isoOrNull(rs, "payment_confirmed_at"));
-    put(row, "paymentDisputeNote", rs.getString("payment_dispute_note"));
-    put(row, "attachmentUrl", rs.getString("attachment_url"));
-    put(row, "attachmentKind", rs.getString("attachment_kind"));
-    put(row, "attachmentName", rs.getString("attachment_name"));
-    put(row, "deliveryNote", rs.getString("delivery_note"));
-    put(row, "deliveryAttachmentUrl", rs.getString("delivery_attachment_url"));
-    put(row, "deliveryAttachmentKind", rs.getString("delivery_attachment_kind"));
-    put(row, "deliveryAttachmentName", rs.getString("delivery_attachment_name"));
-    row.put("createdAt", iso(rs, "created_at"));
-    put(row, "deliveredAt", isoOrNull(rs, "delivered_at"));
-    put(row, "completedAt", isoOrNull(rs, "completed_at"));
+    put(row, "paymentSubmittedAt", isoOrNull(doc.get("paymentSubmittedAt")));
+    put(row, "paymentConfirmedAt", isoOrNull(doc.get("paymentConfirmedAt")));
+    put(row, "paymentDisputeNote", strOrNull(doc.get("paymentDisputeNote")));
+    put(row, "attachmentUrl", strOrNull(doc.get("attachmentUrl")));
+    put(row, "attachmentKind", strOrNull(doc.get("attachmentKind")));
+    put(row, "attachmentName", strOrNull(doc.get("attachmentName")));
+    put(row, "deliveryNote", strOrNull(doc.get("deliveryNote")));
+    put(row, "deliveryAttachmentUrl", strOrNull(doc.get("deliveryAttachmentUrl")));
+    put(row, "deliveryAttachmentKind", strOrNull(doc.get("deliveryAttachmentKind")));
+    put(row, "deliveryAttachmentName", strOrNull(doc.get("deliveryAttachmentName")));
+    row.put("createdAt", iso(doc.get("createdAt")));
+    put(row, "deliveredAt", isoOrNull(doc.get("deliveredAt")));
+    put(row, "completedAt", isoOrNull(doc.get("completedAt")));
     return row;
   }
 
-  private static Map<String, Object> review(ResultSet rs) throws SQLException {
+  private Map<String, Object> review(Document doc) {
     Map<String, Object> row = new LinkedHashMap<>();
-    row.put("id", rs.getString("id"));
-    row.put("orderId", rs.getString("order_id"));
-    row.put("buyerId", rs.getString("buyer_id"));
-    row.put("musicianId", rs.getString("musician_id"));
-    row.put("rating", rs.getInt("rating"));
-    row.put("comment", rs.getString("comment") == null ? "" : rs.getString("comment"));
-    row.put("orderTitle", rs.getString("order_title") == null ? "" : rs.getString("order_title"));
-    row.put("priceBdt", rs.getInt("price_bdt"));
-    row.put("createdAt", iso(rs, "created_at"));
+    row.put("id", idOf(doc));
+    row.put("orderId", str(doc.get("orderId")));
+    row.put("buyerId", str(doc.get("buyerId")));
+    row.put("musicianId", str(doc.get("musicianId")));
+    row.put("rating", num(doc.get("rating")));
+    row.put("comment", doc.get("comment") == null ? "" : str(doc.get("comment")));
+    row.put("orderTitle", doc.get("orderTitle") == null ? "" : str(doc.get("orderTitle")));
+    row.put("priceBdt", num(doc.get("priceBdt")));
+    row.put("createdAt", iso(doc.get("createdAt")));
     return row;
   }
 
-  private static List<String> list(ResultSet rs, String column) throws SQLException {
-    List<String> value = listOrNull(rs, column);
-    return value == null ? List.of() : value;
+  private static Document toDoc(String id, Map<String, Object> source) {
+    Document doc = new Document("_id", id).append("id", id);
+    for (Map.Entry<String, Object> entry : source.entrySet()) {
+      if ("id".equals(entry.getKey()) || entry.getValue() == null) continue;
+      Object value = entry.getValue();
+      if (DATE_KEYS.contains(entry.getKey())) value = toDate(value);
+      if (value != null) doc.put(entry.getKey(), value);
+    }
+    return doc;
   }
 
-  private static List<String> listOrNull(ResultSet rs, String column) throws SQLException {
-    String json = rs.getString(column);
-    if (rs.wasNull() || json == null) return null;
-    return JsonText.strings(json);
+  private static Date toDate(Object value) {
+    if (value instanceof Date date) return date;
+    if (value instanceof Number number) return new Date(number.longValue());
+    String text = strOrNull(value);
+    if (text == null) return new Date();
+    return parseDate(text);
   }
 
-  private static void putList(Map<String, Object> row, String key, ResultSet rs, String column) throws SQLException {
-    List<String> value = listOrNull(rs, column);
-    if (value != null) row.put(key, value);
+  private static void copy(Document target, Document source, String key) {
+    if (source.get(key) != null) target.put(key, source.get(key));
+  }
+
+  private static Update optional(Update update, String key, Object value) {
+    if (value == null || (value instanceof String text && text.isBlank())) update.unset(key);
+    else update.set(key, value);
+    return update;
   }
 
   private static void put(Map<String, Object> row, String key, String value) {
     if (value != null && !value.isEmpty()) row.put(key, value);
   }
 
-  private static void putNum(Map<String, Object> row, String key, ResultSet rs, String column) throws SQLException {
-    int value = rs.getInt(column);
-    if (!rs.wasNull()) row.put(key, value);
+  private static void putNum(Map<String, Object> row, String key, Object value) {
+    if (value instanceof Number) row.put(key, num(value));
   }
 
-  private static String iso(ResultSet rs, String column) throws SQLException {
-    String value = isoOrNull(rs, column);
-    return value == null ? ISO.format(Instant.now()) : value;
+  private static String iso(Object value) {
+    String text = isoOrNull(value);
+    return text == null ? ISO.format(Instant.now()) : text;
   }
 
-  private static String isoOrNull(ResultSet rs, String column) throws SQLException {
-    Timestamp ts = rs.getTimestamp(column);
-    if (ts == null) return null;
-    return ISO.format(ts.toInstant());
+  private static String isoOrNull(Object value) {
+    if (value == null) return null;
+    if (value instanceof Date date) return ISO.format(date.toInstant());
+    if (value instanceof Number number) return ISO.format(Instant.ofEpochMilli(number.longValue()));
+    String text = strOrNull(value);
+    return text;
   }
 
-  private static Timestamp timestamp(String iso) {
-    if (iso == null || iso.isBlank()) return Timestamp.from(Instant.now());
-    return Timestamp.from(Instant.parse(iso));
+  private static Date parseDate(String text) {
+    try {
+      return Date.from(Instant.parse(text));
+    } catch (RuntimeException ignored) {
+      try {
+        return Date.from(OffsetDateTime.parse(text).toInstant());
+      } catch (RuntimeException ex) {
+        return new Date();
+      }
+    }
+  }
+
+  private static long epoch(Object value) {
+    if (value instanceof Date date) return date.getTime();
+    if (value instanceof Number number) return number.longValue();
+    String text = strOrNull(value);
+    if (text == null) return 0L;
+    return parseDate(text).getTime();
   }
 
   @SuppressWarnings("unchecked")
   private static List<String> strings(Object value) {
-    if (value instanceof List<?> list) {
-      List<String> out = new ArrayList<>();
-      for (Object item : list) if (item != null) out.add(String.valueOf(item));
-      return out;
-    }
-    return List.of();
+    if (!(value instanceof List<?> list)) return List.of();
+    List<String> out = new ArrayList<>();
+    for (Object item : list) if (item != null && !String.valueOf(item).isEmpty()) out.add(String.valueOf(item));
+    return out;
+  }
+
+  private static List<String> lower(List<String> values) {
+    List<String> out = new ArrayList<>();
+    for (String value : values) out.add(value.toLowerCase(Locale.ROOT));
+    return out;
+  }
+
+  private static String lower(String value) {
+    return value.toLowerCase(Locale.ROOT);
+  }
+
+  private static String idOf(Document doc) {
+    Object id = doc.get("id");
+    if (id == null) id = doc.get("_id");
+    return id == null ? "" : String.valueOf(id);
   }
 
   private static String str(Object value) {
     return value == null ? "" : String.valueOf(value);
   }
 
+  private static String strOrNull(Object value) {
+    if (value == null) return null;
+    String text = String.valueOf(value);
+    return text.isEmpty() ? null : text;
+  }
+
   private static int num(Object value) {
-    if (value instanceof Number n) return n.intValue();
+    if (value instanceof Number number) return number.intValue();
     return 0;
+  }
+
+  private static boolean bool(Object value) {
+    return Boolean.TRUE.equals(value) || "true".equals(value);
+  }
+
+  private static BigDecimal decimal(Object value) {
+    if (value instanceof BigDecimal decimal) return decimal;
+    if (value instanceof Number number) return BigDecimal.valueOf(number.doubleValue()).setScale(1, RoundingMode.HALF_UP);
+    return BigDecimal.valueOf(5.0);
   }
 
   private static String blankToNull(String value) {
@@ -746,31 +770,5 @@ public class CommunityRepository {
 
   public record FeedSlot(String id, int preferred, int ratingCount, int popular, BigDecimal rating, long createdAtEpoch) {}
 
-  public record FeedCursor(int preferred, int ratingCount, int popular, BigDecimal rating, Timestamp createdAt, String id) {
-    int bind(PreparedStatement ps, int index) throws SQLException {
-      int i = index;
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, ratingCount);
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, ratingCount);
-      ps.setInt(i++, popular);
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, ratingCount);
-      ps.setInt(i++, popular);
-      ps.setBigDecimal(i++, rating);
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, ratingCount);
-      ps.setInt(i++, popular);
-      ps.setBigDecimal(i++, rating);
-      ps.setTimestamp(i++, createdAt);
-      ps.setInt(i++, preferred);
-      ps.setInt(i++, ratingCount);
-      ps.setInt(i++, popular);
-      ps.setBigDecimal(i++, rating);
-      ps.setTimestamp(i++, createdAt);
-      ps.setString(i++, id);
-      return i;
-    }
-  }
+  public record FeedCursor(int preferred, int ratingCount, int popular, BigDecimal rating, long createdAtEpoch, String id) {}
 }

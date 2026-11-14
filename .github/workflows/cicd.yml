@@ -1,4 +1,4 @@
-name: Docker Bake & Push (GitOps / Argo CD)
+name: Publish API and deploy on GCP
 
 on:
   push:
@@ -6,46 +6,14 @@ on:
       - main
       - master
   workflow_dispatch:
-    inputs:
-      tier:
-        description: "Image namespace tier (qa | pps | prod | all)"
-        required: true
-        default: "qa"
-        type: choice
-        options:
-          - qa
-          - pps
-          - prod
-          - all
-      tag:
-        description: "Image version tag (e.g. 0.1)"
-        required: true
-        default: "0.1"
-        type: string
-
-env:
-  DEFAULT_VERSION: "0.1"
 
 jobs:
-  build-and-push:
-    name: Build & Push Image via docker-build.sh
+  publish-and-deploy:
+    name: Push image and start the API
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Resolve target & tag
-        id: meta
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TIER="${{ inputs.tier }}"
-            TAG="${{ inputs.tag }}"
-          else
-            TIER="prod"
-            TAG="${DEFAULT_VERSION}"
-          fi
-          echo "tier=${TIER}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -56,11 +24,44 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Run docker-build.sh (Bake & Push)
+      - name: Build and push the API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/surshongi-api:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/surshongi-api:${{ github.sha }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT }}
+
+      - name: Sync Compose and start the API
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_ZONE: ${{ vars.GCP_ZONE }}
+          GCP_INSTANCE: ${{ vars.GCP_INSTANCE }}
+          DEPLOY_DIR: /apps/surshongi/deployment
         run: |
-          chmod +x ./docker-build.sh
-          ./docker-build.sh \
-            --env "${{ steps.meta.outputs.tier }}" \
-            --tag "${{ steps.meta.outputs.tag }}" \
-            --registry "${{ vars.DOCKER_REGISTRY }}" \
-            --push
+          test -n "$GCP_PROJECT" || { echo "Set repository variable GCP_PROJECT"; exit 1; }
+          test -n "$GCP_ZONE" || { echo "Set repository variable GCP_ZONE"; exit 1; }
+          test -n "$GCP_INSTANCE" || { echo "Set repository variable GCP_INSTANCE"; exit 1; }
+          gcloud compute ssh "$GCP_INSTANCE" \
+            --project "$GCP_PROJECT" \
+            --zone "$GCP_ZONE" \
+            --command "mkdir -p '$DEPLOY_DIR'"
+          gcloud compute scp docker-compose.yml \
+            "$GCP_INSTANCE:$DEPLOY_DIR/docker-compose.yml" \
+            --project "$GCP_PROJECT" \
+            --zone "$GCP_ZONE"
+          gcloud compute ssh "$GCP_INSTANCE" \
+            --project "$GCP_PROJECT" \
+            --zone "$GCP_ZONE" \
+            --command "cd '$DEPLOY_DIR' && docker compose pull api && docker compose up -d api"

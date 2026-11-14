@@ -4,8 +4,6 @@ import com.surshongi.api.community.CommunityRepository.FeedCursor;
 import com.surshongi.api.community.CommunityRepository.FeedSlot;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
-import java.sql.Timestamp;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -92,7 +90,7 @@ public class FeedService {
           Integer.parseInt(parts[1]),
           Integer.parseInt(parts[2]),
           new BigDecimal(parts[3]),
-          Timestamp.from(Instant.ofEpochMilli(Long.parseLong(parts[4]))),
+          Long.parseLong(parts[4]),
           parts[5]);
     } catch (RuntimeException ex) {
       return null;

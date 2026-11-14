@@ -1,12 +1,14 @@
 package com.surshongi.api.mail;
 
+import com.surshongi.api.community.CommunityRepository;
 import jakarta.mail.internet.MimeMessage;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -16,7 +18,7 @@ import org.springframework.stereotype.Service;
 public class MailService {
   private static final Logger log = LoggerFactory.getLogger(MailService.class);
   private final JavaMailSender mail;
-  private final JdbcTemplate jdbc;
+  private final CommunityRepository repo;
   private final String user;
   private final String pass;
   private final String siteUrl;
@@ -24,12 +26,12 @@ public class MailService {
 
   public MailService(
       JavaMailSender mail,
-      JdbcTemplate jdbc,
+      CommunityRepository repo,
       @Value("${surshongi.smtp-user:}") String user,
       @Value("${surshongi.smtp-pass:}") String pass,
       @Value("${surshongi.site-url:http://localhost:3000}") String siteUrl) {
     this.mail = mail;
-    this.jdbc = jdbc;
+    this.repo = repo;
     this.user = user == null ? "" : user.trim();
     this.pass = pass == null ? "" : pass.replaceAll("\\s+", "");
     this.siteUrl = siteUrl.replaceAll("/$", "");
@@ -59,18 +61,7 @@ public class MailService {
   public void unseenMessages() {
     if (!enabled()) return;
     try {
-      List<Map<String, Object>> rows = jdbc.queryForList(
-          """
-          SELECT m.id, m.text, m.to_id, sender.name AS sender_name,
-                 recipient.name AS recipient_name, recipient.email AS recipient_email
-          FROM chat_messages m
-          JOIN users sender ON sender.id = m.from_id
-          JOIN users recipient ON recipient.id = m.to_id
-          WHERE m.read_at IS NULL AND m.email_notified_at IS NULL
-            AND m.created_at <= NOW() - INTERVAL '1 hour'
-          ORDER BY m.created_at ASC
-          LIMIT 20
-          """);
+      List<Map<String, Object>> rows = repo.unseenMessages(Instant.now().minus(1, ChronoUnit.HOURS));
       for (Map<String, Object> row : rows) {
         send(str(row.get("recipient_email")),
             "Unseen message from " + row.get("sender_name") + " on SurShongi",
@@ -78,7 +69,7 @@ public class MailService {
                 + "<p><strong>" + esc(str(row.get("sender_name"))) + "</strong> sent a message over an hour ago:</p>"
                 + "<blockquote>" + esc(str(row.get("text"))) + "</blockquote>"
                 + "<p><a href=\"" + siteUrl + "/u/" + esc(str(row.get("to_id"))) + "\">Reply on SurShongi</a></p>");
-        jdbc.update("UPDATE chat_messages SET email_notified_at = NOW() WHERE id = ?", row.get("id"));
+        repo.markMessageNotified(str(row.get("id")));
       }
     } catch (Exception ex) {
       log.warn("Unseen-message check failed: {}", ex.getMessage());

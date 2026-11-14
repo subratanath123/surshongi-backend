@@ -50,6 +50,7 @@ public class SearchService {
     List<Map<String, Object>> hits = new ArrayList<>();
     for (Map<String, Object> user : users(db)) {
       if (!Boolean.TRUE.equals(user.get("profileCompleted")) || Boolean.TRUE.equals(user.get("isPrivate"))) continue;
+      if ("member".equals(user.get("accountKind"))) continue;
       Hit hit = match(query, tokens, user, db);
       if (hit == null || hit.score < 0.2) continue;
       Map<String, Object> row = new LinkedHashMap<>();
@@ -130,6 +131,9 @@ public class SearchService {
     StringBuilder skills = new StringBuilder();
     for (String role : strings(user.get("roles"))) skills.append(role).append(' ').append(ROLES.getOrDefault(role, "")).append(' ');
     skills.append(join(user.get("instruments"))).append(' ').append(join(user.get("instrumentsBn")));
+    if ("agency".equals(user.get("accountKind"))) {
+      skills.append(" agency stage performance all-in-one show wedding concert band sound light মঞ্চ অনুষ্ঠান এজেন্সি স্টেজ প্যাকেজ ");
+    }
     if ("female".equals(user.get("gender"))) skills.append(" female woman singer নারী মহিলা");
     if ("male".equals(user.get("gender"))) skills.append(" male man singer পুরুষ");
     fields.add(new Field("skill", "skills", skills.toString()));

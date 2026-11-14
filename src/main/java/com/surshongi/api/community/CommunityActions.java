@@ -46,6 +46,7 @@ public class CommunityActions {
     return switch (action) {
       case "completeProfile" -> completeProfile(me, body, db, meUser);
       case "updatePaymentContacts" -> payment(me, body);
+      case "updateSocialLinks" -> socialLinks(me, body);
       case "updateProfileVisibility" -> visibility(me, body);
       case "updateGender" -> gender(me, body);
       case "updateProfilePhotos" -> photos(me, body);
@@ -71,35 +72,39 @@ public class CommunityActions {
   }
 
   private Map<String, Object> completeProfile(String me, Map<String, Object> body, Map<String, Object> db, Map<String, Object> meUser) {
+    String kind = str(body.get("accountKind"));
+    if (!"agency".equals(kind) && !"member".equals(kind)) kind = "musician";
     String name = clean(body.get("name"), 80);
     String city = clean(body.get("city"), 60);
     String bio = clean(body.get("bio"), BIO_MAX);
     String instrumentsRaw = clean(body.get("instruments"), 300);
     String genresRaw = clean(body.get("genres"), 300);
     int price = digits(body.get("price"));
-    String youtubeId = youtube(body.get("youtubeId"));
-    String audioSrc = media(body.get("audioSrc"));
+    String youtubeId = "member".equals(kind) ? null : youtube(body.get("youtubeId"));
+    String audioSrc = "member".equals(kind) ? null : media(body.get("audioSrc"));
     boolean hasShowcase = collections(db).stream().anyMatch(item -> me.equals(item.get("musicianId")));
     List<String> missing = new ArrayList<>();
     if (name.isEmpty()) missing.add("name");
     if (city.isEmpty()) missing.add("city");
     if (bio.length() < BIO_MIN) missing.add("bio");
-    if (instrumentsRaw.isEmpty()) missing.add("instruments");
-    if (genresRaw.isEmpty()) missing.add("genres");
-    if (price <= 0) missing.add("price");
-    if (youtubeId == null && audioSrc == null && !hasShowcase) missing.add("showcase");
+    if (!"member".equals(kind)) {
+      if (instrumentsRaw.isEmpty()) missing.add("instruments");
+      if (genresRaw.isEmpty()) missing.add("genres");
+      if (price <= 0) missing.add("price");
+    }
+    if ("musician".equals(kind) && youtubeId == null && audioSrc == null && !hasShowcase) missing.add("showcase");
     if (!missing.isEmpty()) {
       throw new ApiException(400, "Profile is incomplete: " + String.join(", ", missing) + ".", missing);
     }
     String role = clean(body.get("role"), 40);
     String gender = "female".equals(body.get("gender")) || "male".equals(body.get("gender")) ? str(body.get("gender")) : null;
-    List<String> instruments = split(instrumentsRaw, role.isEmpty() ? "vocalist" : role);
-    boolean sings = "vocalist".equals(role) || instruments.stream().anyMatch(item -> {
+    List<String> instruments = "member".equals(kind) ? List.of() : split(instrumentsRaw, "agency".equals(kind) ? "Stage" : (role.isEmpty() ? "vocalist" : role));
+    List<String> genres = "member".equals(kind) ? List.of() : split(genresRaw, "agency".equals(kind) ? "Stage show" : "Folk");
+    boolean sings = "musician".equals(kind) && ("vocalist".equals(role) || instruments.stream().anyMatch(item -> {
       String lower = item.toLowerCase();
       return lower.contains("vocal") || lower.contains("singer") || item.contains("কণ্ঠ");
-    });
+    }));
     if (sings && gender == null) throw new ApiException(400, "Choose female or male so the singer cards can list you.");
-    List<String> genres = split(genresRaw, "Folk");
     Map<String, Object> updated = new LinkedHashMap<>(meUser);
     String avatar = media(body.get("avatarUrl"));
     String cover = media(body.get("coverUrl"));
@@ -114,8 +119,9 @@ public class CommunityActions {
     updated.put("city", city);
     updated.put("cityBn", city);
     updated.put("cityTerms", List.of(city.toLowerCase()));
-    updated.put("roles", List.of(role.isEmpty() ? "vocalist" : role));
-    if (gender == null) updated.remove("gender");
+    updated.put("accountKind", kind);
+    updated.put("roles", "musician".equals(kind) ? List.of(role.isEmpty() ? "vocalist" : role) : List.of());
+    if (gender == null || !"musician".equals(kind)) updated.remove("gender");
     else updated.put("gender", gender);
     updated.put("instruments", instruments);
     updated.put("instrumentsBn", instruments);
@@ -124,9 +130,10 @@ public class CommunityActions {
     updated.put("genreTerms", genres.stream().map(String::toLowerCase).toList());
     updated.put("bio", bio);
     updated.put("bioBn", bio);
-    updated.put("priceFromBdt", Math.min(price, 10_000_000));
+    if ("member".equals(kind)) updated.remove("priceFromBdt");
+    else updated.put("priceFromBdt", Math.min(price, 10_000_000));
     if (updated.get("turnaroundDays") == null) updated.put("turnaroundDays", 4);
-    updated.put("openToWork", true);
+    updated.put("openToWork", !"member".equals(kind));
     repo.upsertUser(updated);
     String now = now();
     if (youtubeId != null) {
@@ -143,6 +150,16 @@ public class CommunityActions {
 
   private Map<String, Object> payment(String me, Map<String, Object> body) {
     repo.updatePayment(me, phone(body.get("phone")), phone(body.get("bkashNumber")));
+    return userResponse(me);
+  }
+
+  private Map<String, Object> socialLinks(String me, Map<String, Object> body) {
+    repo.updateSocialLinks(
+        me,
+        socialUrl(body.get("twitterUrl"), "twitter.com", "x.com"),
+        socialUrl(body.get("facebookUrl"), "facebook.com", "fb.com"),
+        socialUrl(body.get("spotifyUrl"), "spotify.com", "open.spotify.com"),
+        socialUrl(body.get("youtubeChannelUrl"), "youtube.com", "music.youtube.com", "youtu.be"));
     return userResponse(me);
   }
 
@@ -572,6 +589,28 @@ public class CommunityActions {
     if (text.isEmpty()) return null;
     if (MEDIA.matcher(text).matches() || text.matches("^https://\\S+$")) return text.length() > 1000 ? text.substring(0, 1000) : text;
     return null;
+  }
+
+  private static String socialUrl(Object value, String... hosts) {
+    String text = str(value).trim();
+    if (text.isEmpty()) return null;
+    if (text.startsWith("http://")) text = "https://" + text.substring("http://".length());
+    if (!text.startsWith("https://")) text = "https://" + text;
+    if (text.length() > 300) throw new ApiException(400, "That link is too long.");
+    java.net.URI uri;
+    try {
+      uri = java.net.URI.create(text);
+    } catch (IllegalArgumentException ex) {
+      throw new ApiException(400, "Enter a full https link.");
+    }
+    String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase(java.util.Locale.ROOT);
+    if (host.startsWith("www.")) host = host.substring(4);
+    boolean allowed = false;
+    for (String item : hosts) {
+      if (host.equals(item) || host.endsWith("." + item)) allowed = true;
+    }
+    if (!allowed || uri.getScheme() == null) throw new ApiException(400, "That link is not from the right site.");
+    return text;
   }
 
   private static String phone(Object value) {
