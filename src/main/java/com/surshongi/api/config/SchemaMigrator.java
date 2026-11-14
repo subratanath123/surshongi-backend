@@ -25,6 +25,8 @@ public class SchemaMigrator implements ApplicationRunner {
     mongo.indexOps("order_reviews").ensureIndex(new Index().on("orderId", Sort.Direction.ASC).unique());
     mongo.indexOps("chat_messages").ensureIndex(new Index().on("createdAt", Sort.Direction.ASC));
     mongo.indexOps("chat_messages").ensureIndex(new Index().on("toId", Sort.Direction.ASC).on("fromId", Sort.Direction.ASC));
+    mongo.indexOps("push_tokens").ensureIndex(new Index().on("token", Sort.Direction.ASC).unique());
+    mongo.indexOps("push_tokens").ensureIndex(new Index().on("userId", Sort.Direction.ASC));
     mongo.indexOps("community_posts").ensureIndex(new Index().on("createdAt", Sort.Direction.DESC));
     mongo.indexOps("service_orders").ensureIndex(new Index().on("buyerId", Sort.Direction.ASC));
     mongo.indexOps("service_orders").ensureIndex(new Index().on("musicianId", Sort.Direction.ASC));

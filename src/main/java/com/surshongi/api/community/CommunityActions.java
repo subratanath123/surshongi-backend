@@ -1,6 +1,7 @@
 package com.surshongi.api.community;
 
 import com.surshongi.api.mail.MailService;
+import com.surshongi.api.push.PushService;
 import com.surshongi.api.web.ApiException;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -27,10 +28,12 @@ public class CommunityActions {
 
   private final CommunityRepository repo;
   private final MailService mail;
+  private final PushService push;
 
-  public CommunityActions(CommunityRepository repo, MailService mail) {
+  public CommunityActions(CommunityRepository repo, MailService mail, PushService push) {
     this.repo = repo;
     this.mail = mail;
+    this.push = push;
   }
 
   public Map<String, Object> databaseFor(String viewerId) {
@@ -60,6 +63,7 @@ public class CommunityActions {
       case "toggleFollow" -> follow(me, body, db);
       case "rateMusician" -> rate(me, body, db);
       case "sendMessage" -> message(me, body, db);
+      case "savePushToken" -> savePushToken(me, body);
       case "markMessagesSeen" -> seen(me, body);
       case "createOrder" -> order(me, body, db);
       case "markOrderDelivered" -> deliver(me, body, db);
@@ -332,7 +336,17 @@ public class CommunityActions {
     if (referenced != null) msg.put("postId", referenced.get("id"));
     msg.put("createdAt", now());
     repo.insertMessage(msg);
+    Map<String, Object> sender = find(users(db), me);
+    String senderName = sender == null ? "SurShongi" : clean(sender.get("name"), 80);
+    push.notifyNewMessage(toId, senderName.isEmpty() ? "SurShongi" : senderName, text);
     return respond(me, Map.of("message", msg));
+  }
+
+  private Map<String, Object> savePushToken(String me, Map<String, Object> body) {
+    String token = str(body.get("token")).trim();
+    if (!token.matches("[\\x21-\\x7E]{80,4096}")) throw new ApiException(400, "Push token is not valid.");
+    repo.savePushToken(me, token);
+    return respond(me, Map.of());
   }
 
   private Map<String, Object> seen(String me, Map<String, Object> body) {

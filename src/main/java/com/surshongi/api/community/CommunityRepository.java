@@ -240,6 +240,25 @@ public class CommunityRepository {
     mongo.save(doc, "chat_messages");
   }
 
+  public void savePushToken(String userId, String token) {
+    Query query = Query.query(Criteria.where("token").is(token));
+    Update update = new Update().set("userId", userId).set("updatedAt", new Date());
+    mongo.upsert(query, update, "push_tokens");
+  }
+
+  public List<String> pushTokens(String userId) {
+    List<String> tokens = new ArrayList<>();
+    for (Document row : mongo.find(Query.query(Criteria.where("userId").is(userId)), Document.class, "push_tokens")) {
+      String token = str(row.get("token"));
+      if (!token.isBlank()) tokens.add(token);
+    }
+    return tokens;
+  }
+
+  public void deletePushToken(String token) {
+    mongo.remove(Query.query(Criteria.where("token").is(token)), "push_tokens");
+  }
+
   public void markSeen(String viewerId, String peerId) {
     Query query = Query.query(Criteria.where("toId").is(viewerId).and("fromId").is(peerId).and("readAt").is(null));
     mongo.updateMulti(query, new Update().set("readAt", new Date()), "chat_messages");
