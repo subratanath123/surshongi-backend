@@ -21,7 +21,7 @@ public class CommunityActions {
   private static final Pattern YOUTUBE = Pattern.compile("^[\\w-]{11}$");
   private static final Pattern SELFIE = Pattern.compile("^/uploads/img-[\\w.-]+$");
   private static final Pattern MEDIA = Pattern.compile("^/(uploads|media|covers)/[\\w.-]+$");
-  private static final Set<String> CATEGORIES = Set.of("work", "offering", "collab");
+  private static final Set<String> CATEGORIES = Set.of("work", "offering", "collab", "gear");
   private static final Set<String> VIDEO = Set.of(".mp4", ".webm", ".mov", ".m4v", ".mkv");
   private static final int BIO_MIN = 30;
   private static final int BIO_MAX = 600;
@@ -242,7 +242,10 @@ public class CommunityActions {
     Map<String, Object> post = new LinkedHashMap<>();
     post.put("id", id("post-"));
     post.put("musicianId", me);
-    post.put("category", CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : "work");
+    String category = CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : "work";
+    post.put("category", category);
+    if ("gear".equals(category)) post.put("listing", "buy".equals(str(body.get("listing"))) ? "buy" : "sell");
+    putIf(post, "imageUrl", media(body.get("imageUrl")));
     post.put("title", title);
     post.put("titleBn", title);
     post.put("text", text);
@@ -265,14 +268,18 @@ public class CommunityActions {
     String title = clean(body.get("title"), 140);
     String text = clean(body.get("text"), 2000);
     if (title.isEmpty() || text.isEmpty()) throw new ApiException(400, "Title and text are required.");
+    String category = CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : str(existing.get("category"));
+    String listing = "gear".equals(category) ? ("buy".equals(str(body.get("listing"))) ? "buy" : "sell") : null;
     repo.updatePost(
         str(existing.get("id")), me,
-        CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : str(existing.get("category")),
+        category,
         title, text,
         textOr(clean(body.get("roleTag"), 40), str(existing.get("roleTag"))),
         positive(body.get("priceBdt")),
         youtube(body.get("youtubeId")),
-        media(body.get("audioSrc")));
+        media(body.get("audioSrc")),
+        listing,
+        media(body.get("imageUrl")));
     return respond(me, Map.of());
   }
 

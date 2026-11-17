@@ -191,7 +191,7 @@ public class CommunityRepository {
     mongo.save(doc, "community_posts");
   }
 
-  public void updatePost(String postId, String musicianId, String category, String title, String text, String role, Integer price, String youtube, String audio) {
+  public void updatePost(String postId, String musicianId, String category, String title, String text, String role, Integer price, String youtube, String audio, String listing, String image) {
     Update update = new Update()
         .set("category", category)
         .set("title", title)
@@ -202,6 +202,10 @@ public class CommunityRepository {
     optional(update, "priceBdt", price);
     optional(update, "youtubeId", youtube);
     optional(update, "audioSrc", audio);
+    if ("buy".equals(listing) || "sell".equals(listing)) update.set("listing", listing);
+    else update.unset("listing");
+    if (image != null) update.set("imageUrl", image);
+    else update.unset("imageUrl");
     mongo.updateFirst(Query.query(Criteria.where("_id").is(postId).and("musicianId").is(musicianId)), update, "community_posts");
   }
 
@@ -601,6 +605,8 @@ public class CommunityRepository {
     row.put("textBn", str(doc.get("textBn")));
     row.put("roleTag", str(doc.get("roleTag")));
     putNum(row, "priceBdt", doc.get("priceBdt"));
+    put(row, "listing", "buy".equals(str(doc.get("listing"))) ? "buy" : "sell".equals(str(doc.get("listing"))) ? "sell" : null);
+    put(row, "imageUrl", strOrNull(doc.get("imageUrl")));
     put(row, "youtubeId", strOrNull(doc.get("youtubeId")));
     put(row, "audioSrc", strOrNull(doc.get("audioSrc")));
     row.put("loves", num(doc.get("loves")));
