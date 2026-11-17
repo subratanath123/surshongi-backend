@@ -244,16 +244,18 @@ public class CommunityActions {
     post.put("musicianId", me);
     String category = CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : "work";
     post.put("category", category);
-    if ("gear".equals(category)) post.put("listing", "buy".equals(str(body.get("listing"))) ? "buy" : "sell");
-    putIf(post, "imageUrl", media(body.get("imageUrl")));
+    boolean gear = "gear".equals(category);
+    String listing = gear ? ("buy".equals(str(body.get("listing"))) ? "buy" : "sell") : null;
+    if (listing != null) post.put("listing", listing);
+    if ("sell".equals(listing)) putIf(post, "imageUrl", media(body.get("imageUrl")));
     post.put("title", title);
     post.put("titleBn", title);
     post.put("text", text);
     post.put("textBn", text);
-    post.put("roleTag", textOr(clean(body.get("roleTag"), 40), roles.isEmpty() ? "vocalist" : roles.get(0)));
+    post.put("roleTag", gear ? "" : textOr(clean(body.get("roleTag"), 40), roles.isEmpty() ? "vocalist" : roles.get(0)));
     if (price != null) post.put("priceBdt", price);
     putIf(post, "youtubeId", youtube(body.get("youtubeId")));
-    putIf(post, "audioSrc", media(body.get("audioSrc")));
+    if (!gear) putIf(post, "audioSrc", media(body.get("audioSrc")));
     post.put("loves", 1);
     post.put("lovedBy", List.of(me));
     post.put("createdAt", now());
@@ -269,17 +271,18 @@ public class CommunityActions {
     String text = clean(body.get("text"), 2000);
     if (title.isEmpty() || text.isEmpty()) throw new ApiException(400, "Title and text are required.");
     String category = CATEGORIES.contains(str(body.get("category"))) ? str(body.get("category")) : str(existing.get("category"));
-    String listing = "gear".equals(category) ? ("buy".equals(str(body.get("listing"))) ? "buy" : "sell") : null;
+    boolean gear = "gear".equals(category);
+    String listing = gear ? ("buy".equals(str(body.get("listing"))) ? "buy" : "sell") : null;
     repo.updatePost(
         str(existing.get("id")), me,
         category,
         title, text,
-        textOr(clean(body.get("roleTag"), 40), str(existing.get("roleTag"))),
+        gear ? "" : textOr(clean(body.get("roleTag"), 40), str(existing.get("roleTag"))),
         positive(body.get("priceBdt")),
         youtube(body.get("youtubeId")),
-        media(body.get("audioSrc")),
+        gear ? null : media(body.get("audioSrc")),
         listing,
-        media(body.get("imageUrl")));
+        "sell".equals(listing) ? media(body.get("imageUrl")) : null);
     return respond(me, Map.of());
   }
 
